@@ -15,10 +15,24 @@ This function initializes the controller, creates the associated interfaces and 
 */
 soaringPenController::soaringPenController(int inputCameraDeviceNumber, int inputMarkerIDNumber, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber)
 {
-spinThreadExitFlag = false;
+shouldExitFlag = false;
 controlEngineIsDisabled = false;
 shutdownControlEngine = false;
 currentlyWaiting = false;
+
+//Open image source
+if(imageSource.open(inputCameraDeviceNumber) != true)
+{
+throw SOMException("Unable to open given camera device number\n", INVALID_FUNCTION_INPUT, __FILE__, __LINE__);
+}
+
+imageSource.set(CV_CAP_PROP_FRAME_WIDTH, CAMERA_IMAGE_WIDTH);
+imageSource.set(CV_CAP_PROP_FRAME_HEIGHT, CAMERA_IMAGE_HEIGHT);
+
+//Get first image (used for automatic dimension detection)
+SOM_TRY
+imageSource >> sourceImage;
+SOM_CATCH("Error retrieving first image\n")
 
 onTheGroundWithMotorsOff = true;
 takingOff = false;
@@ -33,6 +47,32 @@ targetAltitude = 1000.0; //The altitude to maintain in mm
 xHeading = 0.0; 
 yHeading = 0.0; 
 currentAngularVelocitySetting = 0.0; //The setting of the current velocity
+
+//Create ZMQ context
+SOM_TRY
+context.reset(new zmq::context_t);
+SOM_CATCH("Error initializing ZMQ context\n")
+
+//Initialize and bind command receiver socket
+SOM_TRY //Initialize
+commandReceiver.reset(new zmq::socket_t(*(context), ZMQ_PAIR));
+SOM_CATCH("Error initializing command socket\n")
+
+SOM_TRY //Bind
+std::string bindingAddress = "tcp://*:"+ std::to_string(inputGUICommandInterfacePortNumber);
+commandReceiver->bind(bindingAddress.c_str());
+SOM_CATCH("Error binding command receiver\n")
+
+SOM_TRY //Initialize
+videoPublisher.reset(new zmq::socket_t(*(context), ZMQ_PUB));
+SOM_CATCH("Error initializing video sharing socket\n")
+
+SOM_TRY //Bind
+std::string bindingAddress = "tcp://*:"+ std::to_string(inputVideoPublishingPortNumber);
+videoPublisher->bind(bindingAddress.c_str());
+SOM_CATCH("Error binding video publisher\n")
+
+
 
 //Subscribe to the nav-data topic with a buffer size of 1000
 navDataSubscriber = nodeHandle.subscribe("ardrone/navdata", 1000, &soaringPenController::handleNavData, this); 
@@ -104,6 +144,11 @@ SOM_CATCH("Error starting ROS message processing thread\n")
 printf("Spin thread has been initialized\n");
 
 
+SOM_TRY
+videoProcessingAndPublishingThread.reset(new std::thread(&soaringPenController::videoProcessingAndPublishingFunction, this));
+SOM_CATCH("Error starting video processing/publishing thread\n")
+
+printf("Initialization complete\n");
 }
 
 
@@ -402,7 +447,7 @@ This function cleans up the object and waits for any threads the object spawned 
 */
 soaringPenController::~soaringPenController()
 {
-spinThreadExitFlag = true;
+shouldExitFlag = true;
 spinThread->join();
 }
 
@@ -980,10 +1025,66 @@ setVelocityAndRotation(xThrottle, yThrottle, zThrottle, zRotationThrottle);
 */
 }
 
+/**
+This function takes video frames from the camera device, publishes them and updates the aruco marker based state estimation information for use by the ROS callbacks.  This function is typically called in a seperate thread.
+*/
+void soaringPenController::videoProcessingAndPublishingFunction()
+{
+try
+{
+while(true) 
+{
+if(shouldExitFlag)
+{
+return;
+}
+
+if(imageSource.grab() != true)
+{
+fprintf(stderr, "Error, unable to get image from video source\n");
+return;
+}
+
+//Get image from camera
+if(imageSource.retrieve(sourceImage) != true)
+{
+fprintf(stderr, "Error getting image\n");
+return;
+}
+
+//Compress/encode it for transmission
+std::vector<unsigned char> encodedImage;
+std::vector<int> options; //Pairs of format type:value
+
+//Set jpg quality
+options.push_back(CV_IMWRITE_JPEG_QUALITY);
+options.push_back(95);
+
+if(cv::imencode(".jpg", sourceImage, encodedImage, options) != true)
+{
+fprintf(stderr, "Error encoding image\n");
+return;
+}
+
+//Publish image
+SOM_TRY
+videoPublisher->send(encodedImage.data(), encodedImage.size());
+SOM_CATCH("Error publishing image\n");
+
+}
+
+}
+catch(const std::exception &inputException)
+{
+fprintf(stderr, "%s\n", inputException.what());
+return;
+}
+
+}
 
 
 /**
-This function repeatedly calls ros::spinOnce until the spinThreadExitFlag in the given object is set (usually by the object destructor.  It is usually run in a seperate thread.
+This function repeatedly calls ros::spinOnce until the shouldExitFlag in the given object is set (usually by the object destructor.  It is usually run in a seperate thread.
 @param inputsoaringPenController: The node this function call is associated
 */
 void soaringPen::initializeAndRunSpinThread(soaringPenController *inputsoaringPenController)
@@ -991,7 +1092,7 @@ void soaringPen::initializeAndRunSpinThread(soaringPenController *inputsoaringPe
 //Set camera to look forward for tags
 inputsoaringPenController->setCameraFront(true);
 
-while(inputsoaringPenController->spinThreadExitFlag != true)
+while(inputsoaringPenController->shouldExitFlag != true)
 {
 ros::spinOnce();
 }

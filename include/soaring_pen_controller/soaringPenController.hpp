@@ -65,6 +65,9 @@
 #define ALTITUDE_CONTROL_PUBLISHER_STRING "/ardrone_command/altitude_control"
 #define COMMAND_PROCESSING_INFO_PUBLISHER_STRING "/ardrone_command/command_processing"
 
+//Define the size of the camera image to try to get
+#define CAMERA_IMAGE_WIDTH  1280
+#define CAMERA_IMAGE_HEIGHT 720
 
 namespace soaringPen
 {
@@ -231,6 +234,16 @@ This function takes care of low level behavior that depends on the specific stat
 */
 void handleLowLevelBehavior();
 
+/**
+This function takes video frames from the camera device, publishes them and updates the aruco marker based state estimation information for use by the ROS callbacks.  This function is typically called in a seperate thread.
+*/
+void videoProcessingAndPublishingFunction();
+
+//Owned by the videoProcessingAndPublishingThread
+cv::VideoCapture imageSource;
+cv::Mat sourceImage;
+int markerIDNumber; //The ID of the aruco marker to look for
+
 bool shutdownControlEngine;
 bool controlEngineIsDisabled;
 bool onTheGroundWithMotorsOff;
@@ -288,9 +301,13 @@ std::chrono::time_point<std::chrono::high_resolution_clock> navdataUpdateTime; /
 
 ros::NodeHandle nodeHandle;
 
-bool spinThreadExitFlag; //This flag indicates if thread that is calling spinOnce should exit
+bool shouldExitFlag; //This flag indicates if thread that is calling spinOnce should exit
 std::unique_ptr<std::thread> spinThread;
+std::unique_ptr<std::thread> videoProcessingAndPublishingThread;
 
+std::unique_ptr<zmq::context_t> context;
+std::unique_ptr<zmq::socket_t> commandReceiver; //A ZMQ PAIR socket which expects gui_command messages and sends controller_status_update messages
+std::unique_ptr<zmq::socket_t> videoPublisher; //A ZMQ PUB socket which publishs JPeg images (using opencv for serialization) from the camera device
 
 ros::Subscriber navDataSubscriber; 
 ros::Subscriber videoSubscriber; 
