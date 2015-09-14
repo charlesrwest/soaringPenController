@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(ardrone_command)
+project(soaring_pen_controller)
 
 #Get c++11
 ADD_DEFINITIONS(-std=c++11)
@@ -19,6 +19,10 @@ find_package(catkin REQUIRED COMPONENTS
 
 )
 
+find_package(Protobuf REQUIRED)
+
+#Generate the C++ for the messages from the libprotobuf markup
+add_subdirectory(./protobufMessages)
 
  add_message_files(
    DIRECTORY msg
@@ -52,8 +56,8 @@ generate_messages(DEPENDENCIES geometry_msgs std_msgs)
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-INCLUDE_DIRS include/
-LIBRARIES ardrone_command_library
+INCLUDE_DIRS include/ protobufMessages/ /usr/local/include/aruco/
+LIBRARIES soaring_pen_controller_library
 #  CATKIN_DEPENDS roscpp rospy std_msgs
 #  DEPENDS system_lib
 CATKIN_DEPENDS message_runtime ardrone_autonomy
@@ -131,7 +135,7 @@ CATKIN_DEPENDS message_runtime ardrone_autonomy
 
 #message('Yowser' ${ardrone_autonomy_INCLUDE_DIRS})
 # Add headers directory
-include_directories(${CATKIN_DEVEL_PREFIX}/ardrone_command ${catkin_INCLUDE_DIRS} include/ardrone_command/)
+include_directories(${CATKIN_DEVEL_PREFIX}/soaring_pen_controller ${catkin_INCLUDE_DIRS} include/soaring_pen_controller/ protobufMessages/ /usr/local/include/aruco/)
 
 #include_directories(include)
 
@@ -140,13 +144,13 @@ include_directories(${CATKIN_DEVEL_PREFIX}/ardrone_command ${catkin_INCLUDE_DIRS
 FILE(GLOB LIBRARY_SOURCEFILES src/lib/*.cpp src/lib/*.c)
 FILE(GLOB EXECUTABLE_SOURCEFILES src/exec/*.cpp src/exec/*.c)
 
-add_library(ardrone_command_library ${LIBRARY_SOURCEFILES})
-target_link_libraries(ardrone_command_library ${catkin_LIBRARIES} zbar opencv_core opencv_highgui opencv_calib3d)
-add_dependencies(ardrone_command_library ardrone_command_generate_messages_cpp ${PROJECT_NAME}_gencpp)
+add_library(soaring_pen_controller_library ${LIBRARY_SOURCEFILES})
+target_link_libraries(soaring_pen_controller_library ${catkin_LIBRARIES} opencv_core opencv_highgui opencv_calib3d soaringPenControllerMessages zmq aruco)
+add_dependencies(soaring_pen_controller_library soaring_pen_controller_generate_messages_cpp ${PROJECT_NAME}_gencpp)
 
-add_executable(ardrone_command ${EXECUTABLE_SOURCEFILES})
+add_executable(soaring_pen_controller ${EXECUTABLE_SOURCEFILES})
 
-target_link_libraries(ardrone_command ardrone_command_library)
+target_link_libraries(soaring_pen_controller soaring_pen_controller_library)
 
 
 

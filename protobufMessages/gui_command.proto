@@ -1,0 +1,19 @@
+package soaringPen; //Put in pylongps namespace 
+
+//This message type is used for the GUI to send commands to the controller over the PAIR connection
+message gui_command
+{
+//Data for a travel_path command
+repeated double path_x_coordinates = 10;
+repeated double path_y_coordinates = 20;
+
+//Data for a return to home command
+optional bool return_to_home = 30;
+
+//Data for a emergency stop command
+optional bool emergency_stop = 40;
+
+//Data for a shutdown command (shutdown controller/drones)
+optional bool shutdown = 50;
+}
+

@@ -1,0 +1,13 @@
+package soaringPen; //Put in pylongps namespace 
+
+//This message type is used to for the controller to send updates to the GUI interface indicating the status of the demo/drone
+message controller_status_update
+{
+optional double battery_status = 10; //The amount of charge left in the drone
+optional double x_velocity = 20; //The drone's velocity in the X
+optional double y_velocity = 30; //The drone's velocity in the Y
+optional double x_position = 40; //The drone's normalized position in the camera stream image 
+optional double y_position = 50; //The drone's normalized position in the camera stream image
+optional int64 completed_command_number = 60; //The number of a just completed command (should always be increasing) 
+}
+

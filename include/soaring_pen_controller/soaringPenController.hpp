@@ -1,5 +1,4 @@
-#ifndef ARDRONECONTROLLERNODEHPP
-#define ARDRONECONTROLLERNODEHPP
+#pragma once
 
 #include<mutex>
 #include<thread>
@@ -8,14 +7,15 @@
 #include "ros/ros.h"
 #include "std_msgs/Empty.h"
 
+#include "zmq.hpp"
+#include "aruco.h"
+
 #include "tagTrackingInfo.hpp"
 #include "ARDroneEnums.hpp"
 #include "command.hpp"
 
 #include "SOMException.hpp"
 #include "SOMScopeGuard.hpp"
-#include "QRCodeStateEstimator.hpp"
-#include "QRCodeBasedPoseInformation.hpp"
 
 #include <std_msgs/UInt16.h>
 #include <std_msgs/UInt32.h>
@@ -52,7 +52,8 @@
 #include <queue>
 #include <condition_variable>
 #include <chrono>
-
+#include "gui_command.pb.h"
+#include "controller_status_update.pb.h"
 
 //This defines how long to wait for a QR code sighting when in a mode reliant on QR code state estimation before automatically landing
 #define SECONDS_TO_WAIT_FOR_QR_CODE_BEFORE_LANDING 1
@@ -61,116 +62,75 @@
 #define HIGH_LATENCY_WATER_MARK .3
 
 //Topics that the drone publishes for public consumption
-#define QR_CODE_STATE_PUBLISHER_STRING "/ardrone_command/qr_code_state_estimates"
 #define ALTITUDE_CONTROL_PUBLISHER_STRING "/ardrone_command/altitude_control"
-#define QR_CODE_GO_TO_POINT_CONTROL_PUBLISHER_STRING "/ardrone_command/go_to_point_control"
-#define QR_CODE_ORIENTATION_CONTROL_PUBLISHER_STRING "/ardrone_command/orientation_control"
 #define COMMAND_PROCESSING_INFO_PUBLISHER_STRING "/ardrone_command/command_processing"
 
 
+namespace soaringPen
+{
 
 
-/*
-This object subscribes to a set of ROS information streams that are available regarding a AR drone (some of which may be aggregators of other streams) and publishes a command stream to control the drone using information gleamed from those streams.  This object also has commands available to launch the other nodes so that it may subscribe to them.
+/**
+This object subscribes to a set of ROS information streams that are available regarding a AR drone (some of which may be aggregators of other streams).
 */
-class ARDroneControllerNode
+class soaringPenController
 {
 public:
-/*
-This function takes the AR drone address and starts up the nessisary ROS nodes to be able to communicate with it.  If the string is empty, it uses the default AR drone address (currently only default functionality is implemented).  It also initializes the QR code based state estimation engine used for QR code based commands.
-@param inputCameraImageWidth: The width of camera images used in the camera calibration
-@param inputCameraImageHeight: The height of the camera images used in the camera calibration
-@param inputCameraCalibrationMatrix: This is a 3x3 matrix that describes the camera transform (taking the distortion into account) in opencv format
-@param inputDistortionParameters: a 1x5 matrix which has the distortion parameters k1, k2, p1, p2, k3
-@param inputARDroneAddress: The address of the AR drone to connect to 
+/**
+This function initializes the controller, creates the associated interfaces and starts the associated threads.
+@param inputCameraDeviceNumber: The opencv device number that the downward facing camera tracking the drone is connected to
+@param inputMarkerIDNumber: The number associated with the aruco marker placed on the drone (should be 0 to 1023)
+@param inputGUICommandInterfacePortNumber: The port to create the ZMQ pair interface used to talk with the user interface with
+@param inputVideoPublishingPortNumber: The port to create the ZMQ PUB interface to publish video on
 
 @exceptions: This function can throw exceptions
 */
-ARDroneControllerNode(int inputCameraImageWidth, int inputCameraImageHeight, const cv::Mat_<double> &inputCameraCalibrationMatrix, const cv::Mat_<double> &inputCameraDistortionParameters, std::string inputARDroneAddress = "");
+soaringPenController(int inputCameraDeviceNumber, int inputMarkerIDNumber, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber);
 
-/*
-This function allows a command to be added to the queue of commands for the drone to execute.  This function is threadsafe, so it can be used from multiple threads but may sometimes block.
-@param inputCommand: The command to add
 
-@exceptions: This function can throw exceptions
-*/
-void addCommand(const command &inputCommand);
 
-/*
-This function allows an outside thread to see how many commands there are in the current queue.  This does not count the one (if any) currently executing. This function is threadsafe (and so may sometimes block).
-@return: The number of commands in the current queue
-
-@exceptions: This function can throw exceptions
-*/
-int commandQueueSize();
-
-/*
+/**
 This function cleans up the object and waits for any threads the object spawned to return.
 */
-~ARDroneControllerNode();
+~soaringPenController();
 
 
-bool manualControlEnabled; //Not currently set up
-
-friend void initializeAndRunSpinThread(ARDroneControllerNode *inputARDroneControllerNode);
+friend void initializeAndRunSpinThread(soaringPenController *inputsoaringPenController);
 
 //Only used as callback
 
-/*
+/**
 This function is used as a callback to handle navdata info.
 @param inputMessage: The legacy nav-data message to handle 
 */
 void handleNavData(const ardrone_autonomy::Navdata::ConstPtr &inputMessage);
 
-/*
-This function is used as a callback to handle images from the AR drone.
-@param inputImageMessage: The image message to handle 
-*/
-void handleImageUpdate(const sensor_msgs::ImageConstPtr& inputImageMessage);
-
 private:
-/*
-This threadsafe function copies the next available command in the buffer and returns false if there was no command to give.  Retrieved commands are remain in the buffer.
-@param inputCommandBuffer: The next command in the queue or the same as before if no command was available
-@return: True if there was a new command and false otherwise
-*/
-bool copyNextCommand(command &inputCommandBuffer);
-
-/*
-This threadsafe function deletes the next available command in the buffer.  If the buffer is empty, it returns without deleting.
-*/
-void popNextCommand();
-
-/*
-This threadsafe function removes all of the elements in the command queue
-*/
-void clearCommandQueue();
-
-/*
+/**
 This function is called to update the local cache of navdata information based on the given message.
 @param inputMessage: The navdata message to update the cache with
 */
 void updateNavdataCache(const ardrone_autonomy::Navdata::ConstPtr &inputMessage);
 
-/*
+/**
 This function sends a message to tell the drone to takeoff using its built in takeoff sequence
 @exceptions: This function can throw exceptions
 */
 void activateTakeoffSequence();
 
-/*
+/**
 This function sends a message to tell the drone to land using its built in landing sequence
 @exceptions: This function can throw exceptions
 */
 void activateLandingSequence();
 
-/*
+/**
 This function sends a message to tell the drone to active its emergency stop sequence (cutting power to the engines)
 @exceptions: This function can throw exceptions
 */
 void activateEmergencyStop();
 
-/*
+/**
 This function sends a message to set the linear and angular velocity of the drone
 @param inputVelocityX: The X velocity of the drone
 @param inputVelocityY: The Y velocity of the drone
@@ -180,13 +140,13 @@ This function sends a message to set the linear and angular velocity of the dron
 */
 void setVelocityAndRotation(double inputVelocityX, double inputVelocityY, double inputVelocityZ, double inputRotationZ);
 
-/*
+/**
 This function sets the linear and angular velocity of the drone to zero and enables the auto-hover mode to try to maintain its position
 @exceptions: This function can throw exceptions
 */
 void enableAutoHover();
 
-/*
+/**
 This function either sets the active camera to the front facing one or the bottom one
 @param inputSetCameraFront: True if the front camera should be set active, false if the bottom camera should be
 
@@ -194,7 +154,7 @@ This function either sets the active camera to the front facing one or the botto
 */
 void setCameraFront(bool inputSetCameraFront);
 
-/*
+/**
 This function will trigger an LED animation sequence on the quadcopter
 @param inputAnimationType: The type of the animation
 @param inputFrequency: The frequency of the animation (if blinking), in hertz
@@ -204,7 +164,7 @@ This function will trigger an LED animation sequence on the quadcopter
 */
 void activateLEDAnimationSequence(LEDAnimationType inputAnimationType, double inputFrequency, int inputDuration);
 
-/*
+/**
 This function will trigger a flight animation
 @param inputFlightAnimationType: What type of flight animation to perform
 
@@ -212,68 +172,50 @@ This function will trigger a flight animation
 */
 void activateFlightAnimation(flightAnimationType inputFlightAnimationType);
 
-/*
+/**
 This function causes the drone to recalibrate its rotations using the assumption that it is on a flat service.  Don't use it when it is not on a flat surface.
 @exceptions: This function can throw exceptions
 */
 void calibrateFlatTrim();
 
-/*
+/**
 This function causes the drone to start recording to its USB stick (if it has one) or stop recording.
 @param inputStartRecording: Set to true if the drone should start recording and false if it should stop
 @exceptions: This function can throw exceptions
 */
 void enableUSBRecording(bool inputStartRecording);
 
-/*
+/**
 This function returns true if the ARDrone has achieved the hovering state.
 @return: True if the hovering state has been achieved
 */
 bool checkIfHoveringStateAchieved();
 
-/*
+/**
 This function returns if the ARDrone has achieved the landed state.
 @return: True if the landed state has been achieved
 */
 bool checkIfLandedStateAchieved();
 
-/*
+/**
 This function checks if a tag has been spotted.
 @return: True if there is one or more tags in the navdata cache
 */
 bool checkIfTagSpotted();
 
-/*
+/**
 This function checks if the target altitude is reached.
 @param inputNumberOfMillimetersToTarget: The wiggle room to match the target height (+- this amount from the target).  It is normally 10 mm.
 */
 bool checkIfAltitudeReached(int inputNumberOfMillimetersToTarget = 10);
 
-/*
-This function checks to see if the last state estimate associated with a QR code identifier is either doesn't exist or is older than the given time.
-@param inputQRCodeIdentifier: The identifier of the QR code that is defining the state estimate
-@param inputSecondsBeforeStale: The number of seconds that can pass before an entry is considered stale
-@return: true if the entry is stale and false otherwise
-*/
-bool checkIfQRCodeStateEstimateIsStale(const std::string &inputQRCodeIdentifier, double inputSecondsBeforeStale);
 
-/*
-This function checks if a command has been completed and should be removed from the queue.
-@return: true if the command has been completed and false otherwise
-*/
-bool checkIfCommandCompleted(const command &inputCommand);
-
-/*
-This function removes the top command from the queue and does any state adjustment associated with the command being completed (such as marking the AR drone as having landed).
-*/
-void removeCompletedCommand();
-
-/*
+/**
 This function takes the appropriate actions for control given the current commands in the queue and data state.  It calls lower level functions to send out the appropriate commands.
 */
 void processCurrentCommandsForUpdateCycle();
 
-/*
+/**
 This function adjusts and enables/disables low level behavior depending on the given command.
 @param inputCommand: The command to execute.
 @return: true if the command has been completed and false otherwise (allowing multiple commands to be executed in a single update cycle if they are instant).
@@ -282,14 +224,12 @@ This function adjusts and enables/disables low level behavior depending on the g
 */
 bool adjustBehavior(const command &inputCommand);
 
-/*
+/**
 This function takes care of low level behavior that depends on the specific state variables (such as reaching the desired altitude and orientation).
 
 @exceptions: This function can throw exceptions
 */
 void handleLowLevelBehavior();
-
-QRCodeStateEstimator QRCodeEngine; //QR code state estimation engine used for QR code based commands
 
 bool shutdownControlEngine;
 bool controlEngineIsDisabled;
@@ -320,10 +260,6 @@ std::string QRCodeToSpotIdentifier; //Identifier of QR code to try to spot
 bool currentlyWaiting;
 std::chrono::time_point<std::chrono::high_resolution_clock> waitFinishTime; //When any current wait command is due to expire
 
-//Mutex protected, only public access through threadsafe addCommand function and threadsafe commandQueueSize function
-std::mutex commandMutex;
-std::queue<command> commandQueue;
-
 enum droneCurrentState state;  //The current state of the drone
 double batteryPercent;  //Percentage of the drone's battery remaining
 double rotationX; //Left/Right tilt in degrees
@@ -348,10 +284,6 @@ double accelerationZ;  //Current estimated Z acceleration
 std::vector<tagTrackingInfo> trackedTags; //Information about any oriented roundel tags in the field of view
 std::chrono::time_point<std::chrono::high_resolution_clock> navdataUpdateTime; //The timestamp of when the navdata update was received
 
-std::vector<double> localTargetPointMovingAverage;
-
-//Structure holding each of the most recently updated entries associated with a given QR code
-std::map<std::string, std::unique_ptr<QRCodeBasedPoseInformation> > QRCodeIDToStateEstimate;
 
 
 ros::NodeHandle nodeHandle;
@@ -382,15 +314,10 @@ ros::Publisher commandProcessingInfoPublisher;
 };
 
 
-/*
+/**
 This function repeatedly calls ros::spinOnce until the spinThreadExitFlag in the given object is set (usually by the object destructor.  It is usually run in a seperate thread.
-@param inputARDroneControllerNode: The node this function call is associated
+@param inputsoaringPenController: The node this function call is associated
 */
-void initializeAndRunSpinThread(ARDroneControllerNode *inputARDroneControllerNode);
+void initializeAndRunSpinThread(soaringPenController *inputsoaringPenController);
 
-
-
-
-
-
-#endif
+}
