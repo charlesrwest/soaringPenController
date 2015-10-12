@@ -1,0 +1,20 @@
+package soaringPen; //Put in soaringPen namespace
+
+
+//This message contains no fields but has a large extension option range so that any new "command_message" messages can add its definition to it as an optional or repeated message member.  It is meant to be used with a derived class to allow easy construction of an priority queue.  Which messages the command_message has embedded can be checked with the has_ member functions.
+
+//clear_command_queue_command 10
+//emergency_stop_command 20
+//follow_path_command 30
+//set_flight_animation_command 40
+//set_led_animation_command 50
+//set_target_altitude_command 60
+//takeoff_command 70
+//wait_command 80
+//landing_command 90
+
+message command_message
+{
+optional int32 priority = 1 [default = 0]; //The priority of the message in the queue
+extensions 10 to max; //Numbers 19000 to 19999 are reserved for internal use by libprotobuf
+}

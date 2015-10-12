@@ -1,0 +1,15 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message a command to turn off the motors immediately or exit the emergency mode state.
+message emergency_stop_command
+{
+required bool stop = 1; //True if emergency stop should be activated and false if it should be cleared.
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional emergency_stop_command emergency_stop_command_field = 20;
+}
+}  

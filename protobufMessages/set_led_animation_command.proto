@@ -1,0 +1,36 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+enum led_animation_type
+{
+BLINK_GREEN_RED = 0; 
+BLINK_GREEN = 1;
+BLINK_RED = 2;
+BLINK_ORANGE = 3;
+SNAKE_GREEN_RED = 4;
+FIRE = 5;
+STANDARD = 6;
+RED = 7;
+GREEN = 8;
+RED_SNAKE = 9;
+BLANK = 10;
+LEFT_GREEN_RIGHT_RED = 11;
+LEFT_RED_RIGHT_GREEN = 12;
+BLINK_STANDARD = 13;
+}
+
+//This message a command to perform a particular LED animation.
+message set_led_animation_command
+{
+required led_animation_type animation_type = 1;
+required double frequency = 2; //Frequency in Hz
+required int64 duration = 3; //Duration in seconds
+
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional set_led_animation_command set_led_animation_command_field = 50;
+}
+}  

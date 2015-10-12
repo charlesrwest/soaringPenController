@@ -1,0 +1,16 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message is a command to follow a path defined by a series of waypoints
+message follow_path_command
+{
+repeated double path_x_coordinates = 10;  //The x coordinates of the points in the path (x,y repeated field should be same size)
+repeated double path_y_coordinates = 20;  //The y coordinates of the points in the path
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional follow_path_command follow_path_command_field = 30;
+}
+}  

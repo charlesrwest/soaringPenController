@@ -21,6 +21,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Protobuf REQUIRED)
 
+
 #Generate the C++ for the messages from the libprotobuf markup
 add_subdirectory(./protobufMessages)
 
@@ -145,7 +146,7 @@ FILE(GLOB LIBRARY_SOURCEFILES src/lib/*.cpp src/lib/*.c)
 FILE(GLOB EXECUTABLE_SOURCEFILES src/exec/*.cpp src/exec/*.c)
 
 add_library(soaring_pen_controller_library ${LIBRARY_SOURCEFILES})
-target_link_libraries(soaring_pen_controller_library ${catkin_LIBRARIES} opencv_core opencv_highgui opencv_calib3d soaringPenControllerMessages zmq aruco)
+target_link_libraries(soaring_pen_controller_library ${catkin_LIBRARIES} opencv_core opencv_highgui opencv_calib3d soaringPenControllerMessages zmq aruco PocoFoundation)
 add_dependencies(soaring_pen_controller_library soaring_pen_controller_generate_messages_cpp ${PROJECT_NAME}_gencpp)
 
 add_executable(soaring_pen_controller ${EXECUTABLE_SOURCEFILES})

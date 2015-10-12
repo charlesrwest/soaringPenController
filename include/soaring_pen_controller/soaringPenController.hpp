@@ -13,9 +13,14 @@
 #include "tagTrackingInfo.hpp"
 #include "ARDroneEnums.hpp"
 #include "command.hpp"
+#include "fPoint.hpp"
+#include "utilityFunctions.hpp"
+#include "linearPath.hpp"
 
 #include "SOMException.hpp"
 #include "SOMScopeGuard.hpp"
+#include "Poco/Timestamp.h"
+
 
 #include <std_msgs/UInt16.h>
 #include <std_msgs/UInt32.h>
@@ -26,18 +31,14 @@
 #include <std_srvs/Empty.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/Vector3.h>
-#include "ardrone_command/serialized_ardrone_command.h"
-#include "ardrone_command/altitude_control_state.h"
-#include "ardrone_command/qr_code_state_info.h"
-#include "ardrone_command/qr_go_to_point_control_info.h"
-#include "ardrone_command/qr_orientation_control_info.h"
-#include "ardrone_command/command_status_info.h"
+
 
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
+#include <opencv2/calib3d/calib3d.hpp>
 
 #include <ardrone_autonomy/vector31.h>
 #include <ardrone_autonomy/vector21.h>
@@ -54,20 +55,30 @@
 #include <chrono>
 #include "gui_command.pb.h"
 #include "controller_status_update.pb.h"
+#include "clear_command_queue_command.pb.h"
+#include "emergency_stop_command.pb.h"
+#include "follow_path_command.pb.h"
+#include "set_flight_animation_command.pb.h"
+#include "set_led_animation_command.pb.h"
+#include "set_target_altitude_command.pb.h"
+#include "takeoff_command.pb.h"
+#include "wait_command.pb.h"
+#include "landing_command.pb.h"
 
-//This defines how long to wait for a QR code sighting when in a mode reliant on QR code state estimation before automatically landing
-#define SECONDS_TO_WAIT_FOR_QR_CODE_BEFORE_LANDING 1
 
-//This defines how long to wait (in microseconds) for a QR code before considering the drone to be experiencing "high latency" and having it simply hover for a little while till things mellow out or it considers itself to have lost tracking
-#define HIGH_LATENCY_WATER_MARK .3
-
-//Topics that the drone publishes for public consumption
-#define ALTITUDE_CONTROL_PUBLISHER_STRING "/ardrone_command/altitude_control"
-#define COMMAND_PROCESSING_INFO_PUBLISHER_STRING "/ardrone_command/command_processing"
 
 //Define the size of the camera image to try to get
-#define CAMERA_IMAGE_WIDTH  1280
-#define CAMERA_IMAGE_HEIGHT 720
+const int CAMERA_IMAGE_WIDTH = 1280;
+const int CAMERA_IMAGE_HEIGHT = 720;
+
+const double CAMERA_IMAGE_DIAGONAL_SIZE = sqrt(pow(CAMERA_IMAGE_WIDTH,2.0) + pow(CAMERA_IMAGE_HEIGHT,2.0));
+const double HARRIS_THRESHOLD_PARAMETER_1 = 7.0;
+const double HARRIS_THRESHOLD_PARAMETER_2 = 7.0;
+const int HIGH_PRIORITY_COMMAND_CONSTANT = 10;
+const double PATH_TRANSVERSAL_SPEED = 0.01; //How long to spend transversing one "path" unit in seconds
+
+//This defines how long to wait for a marker sighting when in a mode reliant on state estimation before automatically landing
+const double SECONDS_TO_WAIT_FOR_DRONE_MARKER_BEFORE_LANDING = 0.3;
 
 namespace soaringPen
 {
@@ -83,12 +94,17 @@ public:
 This function initializes the controller, creates the associated interfaces and starts the associated threads.
 @param inputCameraDeviceNumber: The opencv device number that the downward facing camera tracking the drone is connected to
 @param inputMarkerIDNumber: The number associated with the aruco marker placed on the drone (should be 0 to 1023)
+@param inputLandingPadMarkerIDNumber: The number associated with the aruco marker on the landing pad (should be 0 to 1023)
+@param inputCameraIntrinsicsFilePath: The path to the file to load the camera calibration data from
+@param inputHeightOfCameraFromFloor: The height of the overhead camera from the floor in meters
+@param inputMarkerSizeInMeters: The marker size to pass to aruco
 @param inputGUICommandInterfacePortNumber: The port to create the ZMQ pair interface used to talk with the user interface with
 @param inputVideoPublishingPortNumber: The port to create the ZMQ PUB interface to publish video on
 
+
 @exceptions: This function can throw exceptions
 */
-soaringPenController(int inputCameraDeviceNumber, int inputMarkerIDNumber, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber);
+soaringPenController(int inputCameraDeviceNumber, int inputDroneMarkerIDNumber, int inputLandingPadMarkerIDNumber, const std::string &inputCameraIntrinsicsFilePath, double inputHeightOfCameraFromFloor, double inputMarkerSizeInMeters, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber);
 
 
 
@@ -97,8 +113,6 @@ This function cleans up the object and waits for any threads the object spawned 
 */
 ~soaringPenController();
 
-
-friend void initializeAndRunSpinThread(soaringPenController *inputsoaringPenController);
 
 //Only used as callback
 
@@ -189,6 +203,12 @@ This function causes the drone to start recording to its USB stick (if it has on
 void enableUSBRecording(bool inputStartRecording);
 
 /**
+This command checks the conditions associated with the current command type and returns if they have been completed.  This function will always return true if the current command is invalid.
+@return: True if the current command has been completed or is invalid, false otherwise
+*/
+bool checkIfCurrentCommandIsCompleted();
+
+/**
 This function returns true if the ARDrone has achieved the hovering state.
 @return: True if the hovering state has been achieved
 */
@@ -212,6 +232,11 @@ This function checks if the target altitude is reached.
 */
 bool checkIfAltitudeReached(int inputNumberOfMillimetersToTarget = 10);
 
+/**
+This function replaces the current command if there is a higher priority one in the queue or the conditions associated with the command have been met.
+@return: true if the current command has been changed, false otherwise
+*/
+bool updateCurrentCommand();
 
 /**
 This function takes the appropriate actions for control given the current commands in the queue and data state.  It calls lower level functions to send out the appropriate commands.
@@ -219,13 +244,12 @@ This function takes the appropriate actions for control given the current comman
 void processCurrentCommandsForUpdateCycle();
 
 /**
-This function adjusts and enables/disables low level behavior depending on the given command.
-@param inputCommand: The command to execute.
+This function adjusts and enables/disables low level behavior depending on the current command.
 @return: true if the command has been completed and false otherwise (allowing multiple commands to be executed in a single update cycle if they are instant).
 
 @exceptions: This function can throw exceptions
 */
-bool adjustBehavior(const command &inputCommand);
+bool adjustBehavior();
 
 /**
 This function takes care of low level behavior that depends on the specific state variables (such as reaching the desired altitude and orientation).
@@ -239,11 +263,43 @@ This function takes video frames from the camera device, publishes them and upda
 */
 void videoProcessingAndPublishingFunction();
 
+/**
+This function repeatedly calls ros::spinOnce until the shouldExitFlag is set (usually by the object destructor).
+*/
+void initializeAndRunSpinThread();
+
+
 //Owned by the videoProcessingAndPublishingThread
 cv::VideoCapture imageSource;
 cv::Mat sourceImage;
-int markerIDNumber; //The ID of the aruco marker to look for
+int droneMarkerIDNumber; //The ID of the aruco marker to look for
+int landingPadMarkerIDNumber;
+double markerSizeInMeters; //Used with aruco
+double heightOfCameraFromFloor;
+aruco::CameraParameters cameraIntrinsics;
+aruco::MarkerDetector markerDetector;
 
+std::mutex arucoDataMutex; //Prevent modification by more than one thread at a time
+int framesSinceDroneDetected = 9999999; //The number of frames since the drone marker was seen (should be 0 in normal operation)
+fPoint droneCenter; //Center in the camera image
+fPoint droneXAxis; //X axis in the camera image
+fPoint droneYAxis; //Y axis in the camera image
+bool landingAreaHasBeenDetected = false;
+fPoint landingAreaCenter; //Center in the camera image
+fPoint landingAreaXAxis; //X axis in the camera image
+fPoint landingAreaYAxis; //Y axis in the camera image
+
+int commandCounter = 0; //Used to number commands as they enter the queue
+std::priority_queue<command> commandQueue;
+int completedCommandNumber = -1;
+command currentCommand; //The command we are currently executing, set at a command number of -1 at initialization
+Poco::Timestamp timeCurrentCommandStarted; //Updated whenever a new command is started
+
+linearPath path;
+fPoint pathLocationBuffer;
+fPoint pathTargetPointInLocalRelativeImageCoordinates; //The path point the drone is trying to get to in relative image coordinates relative to the drone
+fPoint pathTargetPointDerivativeLocalInRelativeImageCoordinates; //The derivative of the point the drone is attempting to go for the drone's coordinate system
+fPoint targetOrientationInLocalCoordinates; //A vector pointing to where the drone is suppose to be pointing, in the drone's local coordinate system
 bool shutdownControlEngine;
 bool controlEngineIsDisabled;
 bool onTheGroundWithMotorsOff;
@@ -255,23 +311,13 @@ bool homeInOnTag;
 bool matchTagOrientation;
 bool maintainQRCodeDefinedPosition;
 bool maintainQRCodeDefinedOrientation;
-int commandCounter; //How many commands have been completed
-int lastPublishedCommandCount; //Number of last command that the object published about
 double targetAltitude; //The altitude to maintain in mm
 double targetAltitudeITerm;
 double xHeading; //The current velocity settings of the drone
 double yHeading; 
-double xCoordinateITerm;
-double yCoordinateITerm;
 double currentAngularVelocitySetting; //The setting of the current velocity
-std::vector<double> targetXYZCoordinate; //The target point to reach, if any
-double QRTargetXITerm;
-double QRTargetYITerm;
-std::string targetXYZCoordinateQRCodeIdentifier; //The identifier of the QR code that defines the coordinate system for position holding
-std::string targetOrientationQRCodeIdentifier; //The identifier of the QR code that we are trying to maintain orientation relative to (if any)
-std::string QRCodeToSpotIdentifier; //Identifier of QR code to try to spot
+fPoint pathFollowingITerm;
 bool currentlyWaiting;
-std::chrono::time_point<std::chrono::high_resolution_clock> waitFinishTime; //When any current wait command is due to expire
 
 enum droneCurrentState state;  //The current state of the drone
 double batteryPercent;  //Percentage of the drone's battery remaining
@@ -331,10 +377,16 @@ ros::Publisher commandProcessingInfoPublisher;
 };
 
 
+
+
 /**
-This function repeatedly calls ros::spinOnce until the spinThreadExitFlag in the given object is set (usually by the object destructor.  It is usually run in a seperate thread.
-@param inputsoaringPenController: The node this function call is associated
+This point takes a marker and set of camera intrinsics that were used to generate the marker and stores the centerpoint of the marker, as well as its x axis and y axis in the image.
+@param inputMarker: The marker to process to establish position
+@param inputCameraIntrinsics: The intrinsics of the camera used with marker
+@param inputCenterPointBuffer: The variable to store the resulting center point in
+@param inputXAxisBuffer: The variable to store the resulting 2d X axis in
+@param inputYAxisBuffer: The variable to store the resulting 2d Y axis in
 */
-void initializeAndRunSpinThread(soaringPenController *inputsoaringPenController);
+void getCenterPointAndAxis(aruco::Marker &inputMarker, aruco::CameraParameters &inputCameraIntrinsics, soaringPen::fPoint &inputCenterPointBuffer, soaringPen::fPoint &inputXAxisBuffer, soaringPen::fPoint &inputYAxisBuffer);
 
 }

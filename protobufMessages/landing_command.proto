@@ -1,0 +1,14 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message is a command to land on the ground
+message landing_command
+{
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional landing_command landing_command_field = 90;
+}
+} 

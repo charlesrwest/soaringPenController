@@ -1,0 +1,15 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message a command to try to get to a particular altitude
+message set_target_altitude_command
+{
+required double target_altitude = 1;
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional set_target_altitude_command set_target_altitude_command_field = 60;
+}
+}

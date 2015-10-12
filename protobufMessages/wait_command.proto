@@ -1,0 +1,15 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message is a command to wait while still doing what it is set for
+message wait_command
+{
+required double wait_duration = 1; //The amount to wait
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional wait_command wait_command_field = 80;
+}
+}

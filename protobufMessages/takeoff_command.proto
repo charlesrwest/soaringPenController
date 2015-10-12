@@ -1,0 +1,14 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message is a command to takeoff from the ground
+message takeoff_command
+{
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional takeoff_command takeoff_command_field = 70;
+}
+}

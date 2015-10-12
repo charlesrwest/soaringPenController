@@ -1,0 +1,14 @@
+package soaringPen;
+
+import "command_message.proto"; 
+
+//This message is a command to clear the controller's command queue.  This is generally used when an emergency state is entered to stop all remaining commands until the problem is resolved.
+message clear_command_queue_command
+{
+
+//Add to message container to allow simulated polymorphism
+extend command_message
+{
+optional clear_command_queue_command clear_command_queue_command_field = 10;
+}
+}  

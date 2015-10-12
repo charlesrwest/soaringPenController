@@ -8,17 +8,26 @@ using namespace soaringPen;
 This function initializes the controller, creates the associated interfaces and starts the associated threads.
 @param inputCameraDeviceNumber: The opencv device number that the downward facing camera tracking the drone is connected to
 @param inputMarkerIDNumber: The number associated with the aruco marker placed on the drone (should be 0 to 1023)
+@param inputLandingPadMarkerIDNumber: The number associated with the aruco marker on the landing pad (should be 0 to 1023)
+@param inputCameraIntrinsicsFilePath: The path to the file to load the camera calibration data from
+@param inputHeightOfCameraFromFloor: The height of the overhead camera from the floor in meters
+@param inputMarkerSizeInMeters: The marker size to pass to aruco
 @param inputGUICommandInterfacePortNumber: The port to create the ZMQ pair interface used to talk with the user interface with
 @param inputVideoPublishingPortNumber: The port to create the ZMQ PUB interface to publish video on
 
+
 @exceptions: This function can throw exceptions
 */
-soaringPenController::soaringPenController(int inputCameraDeviceNumber, int inputMarkerIDNumber, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber)
+soaringPenController::soaringPenController(int inputCameraDeviceNumber, int inputDroneMarkerIDNumber, int inputLandingPadMarkerIDNumber, const std::string &inputCameraIntrinsicsFilePath, double inputHeightOfCameraFromFloor, double inputMarkerSizeInMeters, int inputGUICommandInterfacePortNumber, int inputVideoPublishingPortNumber)
 {
 shouldExitFlag = false;
 controlEngineIsDisabled = false;
 shutdownControlEngine = false;
 currentlyWaiting = false;
+markerSizeInMeters = inputMarkerSizeInMeters;
+droneMarkerIDNumber = inputDroneMarkerIDNumber;
+landingPadMarkerIDNumber = inputLandingPadMarkerIDNumber;
+heightOfCameraFromFloor = inputHeightOfCameraFromFloor;
 
 //Open image source
 if(imageSource.open(inputCameraDeviceNumber) != true)
@@ -26,6 +35,8 @@ if(imageSource.open(inputCameraDeviceNumber) != true)
 throw SOMException("Unable to open given camera device number\n", INVALID_FUNCTION_INPUT, __FILE__, __LINE__);
 }
 
+//imageSource.set(CV_CAP_PROP_FOURCC ,CV_FOURCC('Y', 'U', 'Y', 'V') );
+//imageSource.set(CV_CAP_PROP_FPS,10);
 imageSource.set(CV_CAP_PROP_FRAME_WIDTH, CAMERA_IMAGE_WIDTH);
 imageSource.set(CV_CAP_PROP_FRAME_HEIGHT, CAMERA_IMAGE_HEIGHT);
 
@@ -41,8 +52,6 @@ emergencyStopTriggered = false;
 maintainAltitude = false;
 maintainQRCodeDefinedPosition = false;
 maintainQRCodeDefinedOrientation = false;
-commandCounter = 0;
-lastPublishedCommandCount = -1;
 targetAltitude = 1000.0; //The altitude to maintain in mm
 xHeading = 0.0; 
 yHeading = 0.0; 
@@ -72,7 +81,20 @@ std::string bindingAddress = "tcp://*:"+ std::to_string(inputVideoPublishingPort
 videoPublisher->bind(bindingAddress.c_str());
 SOM_CATCH("Error binding video publisher\n")
 
+//Setup aruco
+//Read camera parameters
+SOM_TRY
+cameraIntrinsics.readFromXMLFile(inputCameraIntrinsicsFilePath);
+SOM_CATCH("Error, unable to read camera intrinsics from " + inputCameraIntrinsicsFilePath + "\n")
 
+//Configure marker detector
+markerDetector.setThresholdParams(HARRIS_THRESHOLD_PARAMETER_1, HARRIS_THRESHOLD_PARAMETER_2);
+markerDetector.setThresholdParamRange(2,0); //Not sure what this does
+
+//Automatically resize the camera calibration object to match the current image
+SOM_TRY
+cameraIntrinsics.resize(sourceImage.size());
+SOM_CATCH("Error resizing camera parameters\n") 
 
 //Subscribe to the nav-data topic with a buffer size of 1000
 navDataSubscriber = nodeHandle.subscribe("ardrone/navdata", 1000, &soaringPenController::handleNavData, this); 
@@ -107,41 +129,31 @@ calibrateFlatTrimClient = nodeHandle.serviceClient<std_srvs::Empty>("/ardrone/fl
 //Create client to enable/disable USB recording
 setUSBRecordingClient = nodeHandle.serviceClient<ardrone_autonomy::RecordEnable>("/ardrone/setrecord");
 
-
-printf("Waiting for people to subscribe\n");
-
 //Sleep a little while to allow subscribers to connect
 while(takeOffPublisher.getNumSubscribers() < 1)
 {
 sleep(1);
 }
-printf("Takeoff publisher online\n");
 
 while(landingPublisher.getNumSubscribers() < 1)
 {
 sleep(1);
 }
-printf("Landing publisher online\n");
 
 while(emergencyStopPublisher.getNumSubscribers() < 1)
 {
 sleep(1);
 }
-printf("Emergency stop publisher online\n");
 
 while(directionAndSpeedPublisher.getNumSubscribers() < 1)
 {
 sleep(1);
 }
-printf("Direction and speed publisher online\n");
-
-printf("Subscribe wait finished\n");
 
 //Create seperate thread to call spin
 SOM_TRY
-spinThread.reset(new std::thread(initializeAndRunSpinThread, this));
+spinThread.reset(new std::thread(&soaringPenController::initializeAndRunSpinThread, this));
 SOM_CATCH("Error starting ROS message processing thread\n")
-printf("Spin thread has been initialized\n");
 
 
 SOM_TRY
@@ -217,7 +229,7 @@ motorPWM[1] = inputMessage->motor2;
 motorPWM[2] = inputMessage->motor3;
 motorPWM[3] = inputMessage->motor4;
 velocityX = inputMessage->vx;
-velocityY = inputMessage->vy;
+velocityY = -inputMessage->vy; //Make right positive
 velocityZ = inputMessage->vz;
 accelerationX = inputMessage->ax;
 accelerationY = inputMessage->ay;
@@ -437,7 +449,31 @@ SOM_TRY
 processCurrentCommandsForUpdateCycle();
 SOM_CATCH("Error adjusting/sending commands for commands/behavior")
 
- 
+//Send update to GUI
+fPoint droneCenterBuffer;
+fPoint landingAreaCenterBuffer;
+{
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex to access state data
+droneCenterBuffer = droneCenter;
+landingAreaCenterBuffer = landingAreaCenter;
+}
+
+//Compose message
+controller_status_update statusUpdate;
+
+statusUpdate.set_battery_status(batteryPercent);
+statusUpdate.set_drone_x_velocity(velocityX);
+statusUpdate.set_drone_y_velocity(velocityY);
+statusUpdate.set_drone_x_position(droneCenterBuffer.val[0]);
+statusUpdate.set_drone_y_position(droneCenterBuffer.val[1]);
+statusUpdate.set_landing_area_x_position(landingAreaCenter.val[0]);
+statusUpdate.set_landing_area_y_position(landingAreaCenter.val[1]);
+statusUpdate.set_completed_command_number(completedCommandNumber);
+
+//Send message
+SOM_TRY
+sendProtobufMessage(*commandReceiver, statusUpdate);
+SOM_CATCH("Error serializing/sending protobuf message\n")
 }
 
 
@@ -451,7 +487,83 @@ shouldExitFlag = true;
 spinThread->join();
 }
 
+/**
+This command checks the conditions associated with the current command type and returns if they have been completed.  This function will always return true if the current command is invalid.
+@return: True if the current command has been completed or is invalid, false otherwise
+*/
+bool soaringPenController::checkIfCurrentCommandIsCompleted()
+{
+//TODO: Finish this function
+if(currentCommand.commandNumber == -1)
+{
+return true;
+}
 
+if(currentCommand.HasExtension(clear_command_queue_command::clear_command_queue_command_field))
+{
+return true;
+}
+
+if(currentCommand.HasExtension(emergency_stop_command::emergency_stop_command_field))
+{
+return true;
+}
+
+if(currentCommand.HasExtension(follow_path_command::follow_path_command_field))
+{
+Poco::Timestamp currentTime;
+double timeDifference =  (currentTime - timeCurrentCommandStarted)/1000000.0;
+
+if(path.pathLength < PATH_TRANSVERSAL_SPEED*timeDifference)
+{
+path = linearPath();
+printf("Path completed\n");
+return true; //Path already completed
+}
+else
+{
+return false;
+}
+}
+
+if(currentCommand.HasExtension(set_flight_animation_command::set_flight_animation_command_field))
+{
+return true; //Instant commands return true
+}
+
+if(currentCommand.HasExtension(set_led_animation_command::set_led_animation_command_field))
+{
+return true; //Instant commands return true
+}
+
+if(currentCommand.HasExtension(set_target_altitude_command::set_target_altitude_command_field))
+{
+return true; //Instant commands return true
+}
+
+if(currentCommand.HasExtension(takeoff_command::takeoff_command_field))
+{
+return true;
+}
+
+if(currentCommand.HasExtension(wait_command::wait_command_field))
+{
+Poco::Timestamp currentTime;
+if((currentTime - timeCurrentCommandStarted)/1000000.0 >= currentCommand.GetExtension(wait_command::wait_command_field).wait_duration())
+{
+return true;
+}
+
+return false;
+}
+
+if(currentCommand.HasExtension(landing_command::landing_command_field))
+{
+return true;
+}
+
+return true;
+}
 
 /**
 This function returns true if the ARDrone has achieved the hovering state.
@@ -490,7 +602,26 @@ bool soaringPenController::checkIfAltitudeReached(int inputNumberOfMillimetersTo
 return fabs(altitude - targetAltitude) < inputNumberOfMillimetersToTarget;
 }
 
+/**
+This function replaces the current command if there is a higher priority one in the queue or the conditions associated with the command have been met.
+@return: true if the current command has been changed, false otherwise
+*/
+bool soaringPenController::updateCurrentCommand()
+{
+if(commandQueue.size() > 0)
+{
+if(checkIfCurrentCommandIsCompleted() || currentCommand.priority() < commandQueue.top().priority())
+{
+printf("Moving to next command\n");
+currentCommand = commandQueue.top();
+commandQueue.pop();
+timeCurrentCommandStarted = Poco::Timestamp(); //Set command started time to current time since a new command was loaded
+return true;
+}
+}
 
+return false;
+}
 
 
 
@@ -500,125 +631,207 @@ This function takes the appropriate actions for control given the current comman
 */
 void soaringPenController::processCurrentCommandsForUpdateCycle()
 {
-/*
+try
+{
 while(true)
 {
-command commandBuffer;
-bool gotACommand = copyNextCommand(commandBuffer);
+//Update the current command in case it has been completed
+updateCurrentCommand();
 
-if(gotACommand != true && onTheGroundWithMotorsOff)
+if(currentCommand.commandNumber == -1 && onTheGroundWithMotorsOff)
 {
-//No command is active, but we are on the ground, so just wait
-commandBuffer.setWaitCommand(.1);
+return; //Current command is invalid, but we are on the ground so it is OK
+}
+
+if(currentCommand.commandNumber == -1 && !onTheGroundWithMotorsOff)
+{//Flying, but without commands... Land immediately
+printf("Initiating automatic landing due to lack of commands\n");
+landing_command landCommand;
+command commandBuffer(commandCounter);
+commandCounter++;
+
+(*commandBuffer.MutableExtension(landing_command::landing_command_field)) = landCommand;
+commandQueue.push(commandBuffer);
+}
+
 SOM_TRY
-addCommand(commandBuffer);
-adjustBehavior(commandBuffer);
-return; 
-SOM_CATCH("Error adding wait when there are no commands")
-}
-
-if(gotACommand != true && !onTheGroundWithMotorsOff)
-{
-//No command is active, initiate emergency landing if in the air
-commandBuffer.setEmergencyLandingCommand();
-SOM_TRY
-addCommand(commandBuffer);
-adjustBehavior(commandBuffer);
-return; //Set emergency landing and then exit command loop
-SOM_CATCH("Error setting emergency landing")
-}
-
-if(commandCounter != lastPublishedCommandCount)
-{
-//We have a new command, so publish that we are working on it
-lastPublishedCommandCount = commandCounter;
-ardrone_command::command_status_info message;
-message.time_stamp = ros::Time::now();
-message.commandNumber = commandCounter;
-message.command = commandBuffer.serialize();
-commandProcessingInfoPublisher.publish(message);
-}
-
-if(adjustBehavior(commandBuffer) == true)
-{
-removeCompletedCommand();
+if(adjustBehavior() == false)
+{ //This command will take time to complete, so exit the loop
+break;
 }
 else
 {
-break; //Command will take time to complete, so wait for next navdata update to check
+printf("Command completed\n");
 }
-
+SOM_CATCH("Error adjusting behavior\n")
 }
 
 //Handle low level behaviors using the settings from the adjusted behavior
+printf("About to handle low level stuff\n");
 SOM_TRY
 handleLowLevelBehavior();
 SOM_CATCH("Error, problem implementing low level behavior\n")
-*/
+}
+catch(const std::exception &inputException)
+{
+printf("Exception: %s\n", inputException.what());
+}
+
 }
 
 
 /**
-This function adjusts and enables/disables low level behavior depending on the given command.
-@param inputCommand: The command to execute.
+This function adjusts and enables/disables low level behavior depending on the current command.
 @return: true if the command has been completed and false otherwise (allowing multiple commands to be executed in a single update cycle if they are instant).
 
 @exceptions: This function can throw exceptions
 */
-bool soaringPenController::adjustBehavior(const command &inputCommand)
+bool soaringPenController::adjustBehavior()
 {
-/*
-if(checkIfCommandCompleted(inputCommand))
+if(currentCommand.commandNumber == -1)
 {
-return true; //Command completed already, so do nothing
+printf("No command available\n");
+return false;
 }
 
-switch(inputCommand.type)
+if(currentCommand.HasExtension(clear_command_queue_command::clear_command_queue_command_field))
 {
-case INVALID:
-break;
+printf("Clearing command queue\n");
+while(commandQueue.size() > 0)
+{
+commandQueue.pop();
+}
+return checkIfCurrentCommandIsCompleted();
+}
 
-case SET_CLEAR_COMMAND_QUEUE: //Clear the command queue
-clearCommandQueue();
-return true; //Instant commands return true
-break;
-
-case SET_EMERGENCY_LANDING_COMMAND:
-landing = true;
-clearCommandQueue();
-
-SOM_TRY
-enableAutoHover();//Kill any horizontal velocity
-SOM_CATCH("Error enabling autohover\n")
-
-SOM_TRY
-activateLandingSequence();
-SOM_CATCH("Error activating emergency landing sequence\n")
-return true; //Instant commands return true
-break;
-
-case SET_EMERGENCY_STOP_COMMAND:
+if(currentCommand.HasExtension(emergency_stop_command::emergency_stop_command_field))
+{
+printf("Operating on emergency stop command\n");
 SOM_TRY
 activateEmergencyStop();
 SOM_CATCH("Error activating emergency stop\n")
 emergencyStopTriggered = true;
-clearCommandQueue();
-return true; //Instant commands return true
-break;
-
-case SET_TAKEOFF_COMMAND:
-
-if(takingOff != true)
+while(commandQueue.size() > 0)
 {
+commandQueue.pop();
+}
+return checkIfCurrentCommandIsCompleted();
+}
+
+if(currentCommand.HasExtension(follow_path_command::follow_path_command_field))
+{//TODO: Figure out some way of determining if this is the first time, so the path doesn't always need to be regenerated
+printf("Operating on follow path command\n");
+//Construct path object from command
+const follow_path_command &commandBuffer = currentCommand.GetExtension(follow_path_command::follow_path_command_field);
+path.points.clear();
+for(int i=0; i<commandBuffer.path_x_coordinates_size() && i<commandBuffer.path_y_coordinates_size(); i++)
+{
+path.addPoint(fPoint(commandBuffer.path_x_coordinates(i), commandBuffer.path_y_coordinates(i)));
+}
+
+Poco::Timestamp currentTime;
+double timeDifference =  (currentTime-timeCurrentCommandStarted)/1000000.0;
+
+printf("Path location %lf\nPath Length %lf\n", PATH_TRANSVERSAL_SPEED*timeDifference,path.pathLength);
+
+if(path.pathLength < PATH_TRANSVERSAL_SPEED*timeDifference )
+{
+printf("I think the path is completed\n");
+return checkIfCurrentCommandIsCompleted(); //Path already completed
+}
+
+//Calculate the current path location in relative image coordinates
+fPoint droneCenterBuffer;
+fPoint droneXAxisBuffer;
+fPoint droneYAxisBuffer;
+
+{
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex to access state data
+droneCenterBuffer = droneCenter;
+droneXAxisBuffer = droneXAxis;
+droneYAxisBuffer = droneYAxis;
+}
+//droneXAxisBuffer.normalize(); //Make unit vectors
+//droneYAxisBuffer.normalize();
+
+printf("X axis: %lf %lf\nY axis: %lf %lf\n", droneXAxisBuffer.val[0], droneXAxisBuffer.val[1], droneYAxisBuffer.val[0], droneYAxisBuffer.val[1]);
+
+targetOrientationInLocalCoordinates.val[0] = dot(fPoint(1.0, 0.0), droneXAxisBuffer);
+targetOrientationInLocalCoordinates.val[1] = dot(fPoint(0.0, 1.0), droneYAxisBuffer);
+
+//Compute current path location in image coordinates, then convert to local coordinates
+fPoint pathLocation;
+SOM_TRY
+pathLocation = path.interpolate(PATH_TRANSVERSAL_SPEED*timeDifference);
+SOM_CATCH("Error interpolating path\n")
+fPoint pathLocationDifference = pathLocation - droneCenterBuffer;
+
+pathLocationBuffer = pathLocation;
+
+//Project onto the axises to get local coordinates relative to the drone
+pathTargetPointInLocalRelativeImageCoordinates.val[0] = dot(pathLocationDifference, droneXAxisBuffer);
+pathTargetPointInLocalRelativeImageCoordinates.val[1] = dot(pathLocationDifference, droneYAxisBuffer);
+
+//Do the same for the derivative of the path
+fPoint pathDerivative = path.derivative(PATH_TRANSVERSAL_SPEED*timeDifference);
+
+pathTargetPointDerivativeLocalInRelativeImageCoordinates.val[0] = dot(pathDerivative, droneXAxisBuffer);
+pathTargetPointDerivativeLocalInRelativeImageCoordinates.val[1] = dot(pathDerivative, droneYAxisBuffer);
+return checkIfCurrentCommandIsCompleted();
+}
+
+if(currentCommand.HasExtension(set_flight_animation_command::set_flight_animation_command_field))
+{
+SOM_TRY
+activateFlightAnimation((flightAnimationType) currentCommand.GetExtension(set_flight_animation_command::set_flight_animation_command_field).flight_type());
+SOM_CATCH("Error activating flight animation\n")
+return checkIfCurrentCommandIsCompleted(); //Instant commands return true
+}
+
+if(currentCommand.HasExtension(set_led_animation_command::set_led_animation_command_field))
+{
+const set_led_animation_command &commandBuffer = currentCommand.GetExtension(set_led_animation_command::set_led_animation_command_field);
+SOM_TRY
+activateLEDAnimationSequence((LEDAnimationType) commandBuffer.animation_type(), commandBuffer.frequency(), commandBuffer.duration());
+SOM_CATCH("Error activating LED animation\n")
+return checkIfCurrentCommandIsCompleted(); //Instant commands return true
+}
+
+if(currentCommand.HasExtension(set_target_altitude_command::set_target_altitude_command_field))
+{
+printf("Setting target altitude\n");
+const set_target_altitude_command &commandBuffer = currentCommand.GetExtension(set_target_altitude_command::set_target_altitude_command_field);
+targetAltitude = commandBuffer.target_altitude();
+targetAltitudeITerm = 0.0;
+maintainAltitude = true; //Enable trying to meet a set altitude
+return checkIfCurrentCommandIsCompleted(); //Instant commands return true
+}
+
+if(currentCommand.HasExtension(takeoff_command::takeoff_command_field))
+{
+printf("Taking off\n");
 SOM_TRY
 activateTakeoffSequence();
 onTheGroundWithMotorsOff = false;
 SOM_CATCH("Error activating takeoff sequence")
 takingOff = true;
+return checkIfCurrentCommandIsCompleted();
 }
-break;
 
-case SET_LANDING_COMMAND:
+if(currentCommand.HasExtension(wait_command::wait_command_field))
+{
+Poco::Timestamp currentTime;
+if((currentTime - timeCurrentCommandStarted)/1000000.0 >= currentCommand.GetExtension(wait_command::wait_command_field).wait_duration())
+{
+return checkIfCurrentCommandIsCompleted();
+}
+
+return checkIfCurrentCommandIsCompleted();
+}
+
+if(currentCommand.HasExtension(landing_command::landing_command_field))
+{
+printf("Landing\n");
 if(landing != true)
 {
 SOM_TRY
@@ -626,210 +839,10 @@ activateLandingSequence();
 SOM_CATCH("Error activating landing sequence")
 landing = true;
 }
-break;
-
-case SET_CONTROL_SHUTDOWN_COMMAND:
-shutdownControlEngine = true;
-return true; //Instant commands return true
-break;
-
-case SET_TARGET_ALTITUDE_COMMAND:
-if(inputCommand.doubles.size() > 0)
-{
-targetAltitude = inputCommand.doubles[0];
-targetAltitudeITerm = 0.0;
-maintainAltitude = true; //Enable trying to meet a set altitude
-}
-else
-{
-throw SOMException("Error, set target altitude command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_HORIZONTAL_HEADING_COMMAND:
-if(inputCommand.doubles.size() > 1)
-{
-xHeading = inputCommand.doubles[0];
-yHeading = inputCommand.doubles[1];
-}
-else
-{
-throw SOMException("Error, set set horizontal heading command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_ANGULAR_VELOCITY_COMMAND:
-if(inputCommand.doubles.size() > 0)
-{
-currentAngularVelocitySetting = inputCommand.doubles[0];
-}
-else
-{
-throw SOMException("Error, set angular velocity command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-
-case SET_FLIGHT_ANIMATION_COMMAND:
-if(inputCommand.flightAnimations.size() > 0)
-{
-SOM_TRY
-activateFlightAnimation(inputCommand.flightAnimations[0]);
-SOM_CATCH("Error activating flight animation\n")
-}
-else
-{
-throw SOMException("Error, set flight animation command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_LED_ANIMATION_COMMAND:
-if(inputCommand.ledAnimations.size() > 0 && inputCommand.doubles.size() > 0 && inputCommand.integers.size() > 0)
-{
-SOM_TRY
-activateLEDAnimationSequence(inputCommand.ledAnimations[0], inputCommand.doubles[0], inputCommand.integers[0]);
-SOM_CATCH("Error activating LED animation\n")
-}
-else
-{
-throw SOMException("Error, set led animation command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_MAINTAIN_POSITION_AT_SPECIFIC_QR_CODE_POINT:
-if(inputCommand.doubles.size() == 3 && inputCommand.strings.size() > 0)
-{
-maintainQRCodeDefinedPosition = true;
-targetXYZCoordinate = inputCommand.doubles;
-targetXYZCoordinateQRCodeIdentifier = inputCommand.strings[0];
-QRTargetXITerm = 0.0;
-QRTargetYITerm = 0.0;
-}
-else
-{
-throw SOMException("Error, set QR Code position command invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_CANCEL_MAINTAIN_POSITION_AT_SPECIFIC_QR_CODE_POINT:
-maintainQRCodeDefinedPosition = false;
-return true; //Instant commands return true
-break;
-
-case SET_MAINTAIN_ORIENTATION_TOWARD_SPECIFIC_QR_CODE:
-if(inputCommand.strings.size() > 0)
-{
-maintainQRCodeDefinedOrientation = true;
-targetOrientationQRCodeIdentifier = inputCommand.strings[0];
-}
-else
-{
-throw SOMException("Error, set QR Code orientation target command invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-return true; //Instant commands return true
-break;
-
-case SET_CANCEL_MAINTAIN_ORIENTATION_TOWARD_SPECIFIC_QR_CODE:
-maintainQRCodeDefinedOrientation = false;
-return true; //Instant commands return true
-break;
-
-case SET_WAIT_COMMAND:
-if(!currentlyWaiting)
-{
-if(inputCommand.doubles.size() > 0)
-{
-SOM_TRY
-waitFinishTime = std::chrono::high_resolution_clock::now()  + std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(inputCommand.doubles[0]));
-currentlyWaiting = true;
-SOM_CATCH("Error waiting for seconds\n")
-}
-else
-{
-throw SOMException("Error, waiting for seconds command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-}
-break;
-
-case SET_WAIT_UNTIL_TAG_IS_SPOTTED_COMMAND:
-if(!currentlyWaiting)
-{
-if(inputCommand.doubles.size() > 0)
-{
-SOM_TRY
-waitFinishTime = std::chrono::high_resolution_clock::now()  + std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(inputCommand.doubles[0]));
-currentlyWaiting = true;
-SOM_CATCH("Error waiting for seconds or until tag spotted\n")
-}
-else
-{
-throw SOMException("Error, waiting for seconds or until tag spotted command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-}
-break;
-
-case SET_WAIT_UNTIL_SPECIFIC_QR_CODE_IS_SPOTTED_COMMAND:
-if(!currentlyWaiting)
-{
-if(inputCommand.doubles.size() > 0 && inputCommand.strings.size() > 0)
-{
-SOM_TRY
-QRCodeToSpotIdentifier = inputCommand.strings[0];
-waitFinishTime = std::chrono::high_resolution_clock::now()  + std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(inputCommand.doubles[0]));
-currentlyWaiting = true;
-SOM_CATCH("Error waiting for seconds or until tag spotted\n")
-}
-else
-{
-throw SOMException("Error, waiting for seconds or until QR code spotted command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-}
-break;
-
-case SET_WAIT_UNTIL_POSITION_AT_SPECIFIC_QR_CODE_POINT_REACHED:
-if(!currentlyWaiting)
-{
-if(inputCommand.doubles.size() == 3)
-{
-SOM_TRY
-waitFinishTime = std::chrono::high_resolution_clock::now()  + std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(inputCommand.doubles[0]));
-currentlyWaiting = true;
-printf("Got here!\n");
-SOM_CATCH("Error waiting for seconds or until tag spotted\n")
-}
-else
-{
-throw SOMException("Error, waiting for seconds or until QR code define position is reached command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-}
-break;
-
-case SET_WAIT_UNTIL_ALTITUDE_REACHED:
-if(!currentlyWaiting)
-{
-if(inputCommand.doubles.size() > 0 && inputCommand.integers.size() > 0)
-{
-SOM_TRY
-waitFinishTime = std::chrono::high_resolution_clock::now()  + std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(inputCommand.doubles[0]));
-currentlyWaiting = true;
-SOM_CATCH("Error waiting till altitude reached\n")
-}
-else
-{
-throw SOMException("Error, waiting to reach altitude command is invalid\n", INCORRECT_SERVER_RESPONSE, __FILE__, __LINE__);
-}
-break;
-}
+return checkIfCurrentCommandIsCompleted();
 }
 
-return checkIfCommandCompleted(inputCommand);
-*/
+return checkIfCurrentCommandIsCompleted();
 }
 
 
@@ -840,189 +853,81 @@ This function takes care of low level behavior that depends on the specific stat
 */
 void soaringPenController::handleLowLevelBehavior()
 {
-/*
+printf("I was called\n");
 
 if(controlEngineIsDisabled || onTheGroundWithMotorsOff || emergencyStopTriggered || shutdownControlEngine)
-//if((controlEngineIsDisabled || onTheGroundWithMotorsOff || emergencyStopTriggered || shutdownControlEngine) && !maintainQRCodeDefinedPosition)
 {
-//printf("No control %d %d %d\n", controlEngineIsDisabled,  onTheGroundWithMotorsOff, emergencyStopTriggered);
+printf("No control %d %d %d\n", controlEngineIsDisabled,  onTheGroundWithMotorsOff, emergencyStopTriggered);
 return; //Return if we shouldn't be trying to fly
 }
 
 double zThrottle = 0.0;
-if(maintainQRCodeDefinedPosition)
-{
-//Remove stale I term
-targetAltitudeITerm = 0.0;
-}
 
-if(maintainAltitude && !maintainQRCodeDefinedPosition)
+
+if(maintainAltitude)
 {
 double pTerm = (targetAltitude - fabs(altitude));
-targetAltitudeITerm = targetAltitudeITerm + pTerm;
+//targetAltitudeITerm = targetAltitudeITerm + pTerm;
 
-zThrottle = pTerm/600.0 + targetAltitudeITerm/100000000.0; //PI control for altitude
-
-//Send message to log changes from altitude control
-if(!maintainQRCodeDefinedPosition)
-{
-ardrone_command::altitude_control_state message;
-
-message.time_stamp = ros::Time::now();
-message.target_altitude = targetAltitude;
-message.current_p_term = pTerm;
-message.current_i_term = targetAltitudeITerm;
-
-altitudeControlInfoPublisher.publish(message);
-}
+//zThrottle = pTerm/600.0 + targetAltitudeITerm/100000000.0; //PI control for altitude
 
 //printf("Altitude values: target: %.1lf Current: %.1lf Diff: %.1lf throt:  %.1lf I:%.1lf\n", targetAltitude, altitude, targetAltitude -altitude, zThrottle, targetAltitudeITerm); 
 }
 
-
-
-if(maintainQRCodeDefinedPosition)
-{ //Check to see if we have to engage emergency landing due to losing the code
-if(checkIfQRCodeStateEstimateIsStale(targetXYZCoordinateQRCodeIdentifier, SECONDS_TO_WAIT_FOR_QR_CODE_BEFORE_LANDING))
-{ //We've never seen the QR code that should be defining our coordinate system or it has been too long since we have seen it
+//Land if tracking lost
+if(framesSinceDroneDetected > 10)
+{
 SOM_TRY
-printf("Tracking lost\n");
 maintainQRCodeDefinedPosition = false;
 activateLandingSequence();
-clearCommandQueue();
+while(commandQueue.size() > 0)
+{ //Clear command queue
+commandQueue.pop();
+}
 SOM_CATCH("Error triggering emergency landing and clearing command queue")
-}
-}
-
-
-if(maintainQRCodeDefinedOrientation)
-{ //Check to see if we have to engage emergency landing due to losing the code
-if(checkIfQRCodeStateEstimateIsStale(targetOrientationQRCodeIdentifier, SECONDS_TO_WAIT_FOR_QR_CODE_BEFORE_LANDING))
-{ //We've never seen the QR code that should be defining our coordinate system or it has been too long since we have seen it
-SOM_TRY
-printf("Tracking lost\n");
-maintainQRCodeDefinedOrientation = false;
-activateLandingSequence();
-clearCommandQueue();
-SOM_CATCH("Error triggering emergency landing and clearing command queue")
-}
+return;
 }
 
+//Maintain orientation toward desired position
+//double zRotationThrottle = -targetOrientationInLocalCoordinates.val[0];
+double zRotationThrottle = 0;
 
-double xThrottle = xHeading;
-double yThrottle = yHeading;
+
+//printf("Rotation throttle: %lf\n", zRotationThrottle);
+
+bool followingPath = currentCommand.HasExtension(follow_path_command::follow_path_command_field);
+
+
+//double xThrottle = xHeading;
+//double yThrottle = yHeading;
+
+double xThrottle = 0;
+double yThrottle = 0;
 
 
 
-if(maintainQRCodeDefinedPosition)
+if(followingPath)
 {
-ardrone_command::qr_go_to_point_control_info message;
+pathFollowingITerm = pathFollowingITerm + pathTargetPointInLocalRelativeImageCoordinates;
 
-//Convert target point to the drone's coordinate system
-std::vector<double> localTargetPoint = QRCodeIDToStateEstimate[targetXYZCoordinateQRCodeIdentifier]->convertPointInQRCodeSpaceToCameraSpace(targetXYZCoordinate);
+printf("Relative position: %lf, %lf\n", pathTargetPointInLocalRelativeImageCoordinates.val[0], pathTargetPointInLocalRelativeImageCoordinates.val[1]);
 
-//Update moving average
-double memoryConstant = .9;
-for(int i=0; i<localTargetPointMovingAverage.size(); i++)
-{
-localTargetPointMovingAverage[i] = memoryConstant*localTargetPointMovingAverage[i] +(1.0-memoryConstant)*localTargetPoint[i]; 
-}
+//Lab camera height is 3.048, should be linear increase of parameters with height due to shrinking of pixel distances
 
-//TODO: Change this back, quick substitution for testing
-//localTargetPoint = localTargetPointMovingAverage;
+//Positive x is forward
+xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]) -.0006*velocityX; //-.00015*velocityX
+printf("X Throttle: %lf\n", xThrottle);
 
-std::vector<double> cameraPosition = QRCodeIDToStateEstimate[targetXYZCoordinateQRCodeIdentifier]->currentCameraPosition;
-//printf("Current camera position: %lf %lf %lf\n", cameraPosition[0], cameraPosition[1], cameraPosition[2]);
-
-//printf("Target point: %lf %lf %lf                Mag:%lf\n", localTargetPoint[2], localTargetPoint[0], localTargetPoint[1], sqrt(pow(localTargetPoint[0], 2) + pow(localTargetPoint[1], 2) + pow(localTargetPoint[2], 2) ));
-
-QRTargetXITerm = QRTargetXITerm + localTargetPoint[2];
-QRTargetYITerm = QRTargetYITerm + localTargetPoint[0] ;
-
-double distance = sqrt(pow(localTargetPoint[0], 2) + pow(localTargetPoint[1], 2) + pow(localTargetPoint[2], 2) );
-
-//Use one PID set if close, another if far
-if(distance < 1)
-{ //Near
-message.mode = 0; //Mark as near
-printf("Near\n");
-//Camera xyz maps to ardrone (-y)xz
-xThrottle = -.00015*velocityX+ .1*localTargetPoint[2];//  + .00001*QRTargetXITerm ; //Simple PI control for now
-yThrottle = .00015*velocityY+ .1*localTargetPoint[0];// + .00001*QRTargetYITerm ; 
-zThrottle = -.1*localTargetPoint[1]; 
-printf("X: %lf %lf %lf   Y: %lf %lf %lf  D: %lf\n", -.0002*velocityX, .1*localTargetPoint[2], .00001*QRTargetXITerm, .0002*velocityY, .1*localTargetPoint[0], .00001*QRTargetYITerm, distance);
-
-}
-else
-{//Far
-printf("Far\n");
-message.mode = 1; //Mark far
-//Camera xyz maps to ardrone (-y)xz
-xThrottle = -.0004*velocityX+ .1*localTargetPoint[2];//  + .00001*QRTargetXITerm ; //Simple PI control for now
-yThrottle = .0004*velocityY+ .1*localTargetPoint[0];// + .00001*QRTargetYITerm ; 
-zThrottle = -.05*localTargetPoint[1]; 
-printf("X: %lf %lf %lf   Y: %lf %lf %lf  D: %lf\n", -.0004*velocityX, .1*localTargetPoint[2], .00001*QRTargetXITerm, .0004*velocityY, .1*localTargetPoint[0], .00001*QRTargetYITerm, distance);
+//Positive y is right
+yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]) -.0006*velocityY; //+ .00015*velocityY 
+printf("Y Throttle: %lf\n", yThrottle);
 
 }
 
 
-//Override control to make drone hover if experiencing high latency (but not high enough to make it land)
-
-if(checkIfQRCodeStateEstimateIsStale(targetXYZCoordinateQRCodeIdentifier, HIGH_LATENCY_WATER_MARK))
-{
-xThrottle = 0.0;
-yThrottle = 0.0;
-zThrottle = 0.0;
-printf("Experiencing high latency\n");
-}
-
-
-//Get ready to send message detailing control stuff
-for(int i=0; i<localTargetPoint.size(); i++)
-{
-message.target_point_camera_xyz[i] =  localTargetPoint[i];
-}
-message.target_point_local_xyz[0] = localTargetPoint[2];
-message.target_point_local_xyz[1] = localTargetPoint[0];
-message.target_point_local_xyz[2] = localTargetPoint[1];
-message.estimated_distance_to_target = distance;
-message.qr_xyz_throttle[0] = xThrottle;
-message.qr_xyz_throttle[1] = yThrottle;
-message.qr_xyz_throttle[2] = zThrottle;
-message.qr_x_axis_I_term = QRTargetXITerm;
-message.qr_y_axis_I_term = QRTargetYITerm;
-message.time_stamp = ros::Time::now();
-
-//Send status message
-QRCodeGoToPointControlInfoPublisher.publish(message);
-
-
-//printf("Throttle: %lf %lf %lf  Point: %lf %lf %lf\n", xThrottle, yThrottle, zThrottle, localTargetPoint[2], localTargetPoint[0], localTargetPoint[1]);
-}
-
-double zRotationThrottle = currentAngularVelocitySetting;
-if(maintainQRCodeDefinedOrientation)
-{
-
-std::vector<double> QRCodePoint = QRCodeIDToStateEstimate[targetOrientationQRCodeIdentifier]->currentQRCodePosition;
-
-//printf("Current QR code position: %lf\n", QRCodePoint[0]);
-
-//Override angular velocity setting to track tag orientation
-zRotationThrottle = -QRCodePoint[0]/fabs(QRCodePoint[2]); //Simple bang/bang control for now
-
-//Make status message to send
-ardrone_command::qr_orientation_control_info message;
-message.time_stamp = ros::Time::now();
-message.z_rotation_throttle = zRotationThrottle;
-
-//Send message
-QRCodeOrientationControlInfoPublisher.publish(message);
-}
 
 //Tell the drone how it should move TODO: Change back
 setVelocityAndRotation(xThrottle, yThrottle, zThrottle, zRotationThrottle);
-*/
 }
 
 /**
@@ -1051,6 +956,61 @@ if(imageSource.retrieve(sourceImage) != true)
 fprintf(stderr, "Error getting image\n");
 return;
 }
+
+std::vector<aruco::Marker> detectedMarkers;
+
+//Detect markers
+SOM_TRY
+markerDetector.detect(sourceImage, detectedMarkers, cameraIntrinsics, markerSizeInMeters);
+SOM_CATCH("Error searching for board in image\n")
+
+//Seach for our marker
+bool foundDroneMarker = false;
+for(int i=0; i<detectedMarkers.size(); i++)
+{
+
+//printf("Found: %d\n", detectedMarkers[i].id);
+
+if(detectedMarkers[i].id == droneMarkerIDNumber)
+{
+//Found drone marker, so update state
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex
+framesSinceDroneDetected = 0;
+getCenterPointAndAxis(detectedMarkers[i], cameraIntrinsics, droneCenter, droneXAxis, droneYAxis);
+foundDroneMarker = true;
+
+//Draw marker on drone image
+aruco::CvDrawingUtils::draw3dAxis(sourceImage, detectedMarkers[i], cameraIntrinsics);
+
+continue;
+}
+
+if(detectedMarkers[i].id == landingPadMarkerIDNumber)
+{
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex
+landingAreaHasBeenDetected = true;
+getCenterPointAndAxis(detectedMarkers[i], cameraIntrinsics, landingAreaCenter, landingAreaXAxis, landingAreaYAxis);
+aruco::CvDrawingUtils::draw3dAxis(sourceImage, detectedMarkers[i], cameraIntrinsics);
+}
+
+
+}
+
+if(!foundDroneMarker)
+{
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex
+framesSinceDroneDetected++; //Didn't see the marker this frame
+}
+
+//Draw path location buffer for debugging
+cv::circle(sourceImage, cv::Point((pathLocationBuffer.val[0]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_WIDTH/2.0, (pathLocationBuffer.val[1]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_HEIGHT/2.0), 10, cv::Scalar(255,0,0), 5);
+
+//Draw drone location for debugging
+cv::circle(sourceImage, cv::Point((droneCenter.val[0]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_WIDTH/2.0, (droneCenter.val[1]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_HEIGHT/2.0), 10, cv::Scalar(0,255,0), 5);
+
+//printf("Drawing circle at %lf %lf\n", (pathLocationBuffer.val[0]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_WIDTH/2.0, (pathLocationBuffer.val[1]*CAMERA_IMAGE_DIAGONAL_SIZE)+CAMERA_IMAGE_HEIGHT/2.0);
+
+//todototodo
 
 //Compress/encode it for transmission
 std::vector<unsigned char> encodedImage;
@@ -1084,17 +1044,195 @@ return;
 
 
 /**
-This function repeatedly calls ros::spinOnce until the shouldExitFlag in the given object is set (usually by the object destructor.  It is usually run in a seperate thread.
-@param inputsoaringPenController: The node this function call is associated
+This function repeatedly calls ros::spinOnce until the shouldExitFlag is set (usually by the object destructor).
 */
-void soaringPen::initializeAndRunSpinThread(soaringPenController *inputsoaringPenController)
+void soaringPenController::initializeAndRunSpinThread()
 {
-//Set camera to look forward for tags
-inputsoaringPenController->setCameraFront(true);
+bool messageReceived = false;
+bool messageDeserialized = false;
+while(shouldExitFlag != true)
+{
+//Check if there is a new command message and add it to the queue if so.
+gui_command receivedCommand;
+std::tie(messageReceived, messageDeserialized) = receiveProtobufMessage(*commandReceiver,receivedCommand, ZMQ_NOBLOCK);
 
-while(inputsoaringPenController->shouldExitFlag != true)
+//TODO: Handle the return to home case
+
+if(receivedCommand.has_follow_path_command_field() )
+{ //Add follow path command to queue
+if(landingAreaHasBeenDetected && onTheGroundWithMotorsOff)
+{ //Ignore path command if landing area hasn't been seen or the drone isn't ready
+follow_path_command extendedCommand; //path command after start and finish points have been added
+fPoint landingAreaCenterBuffer;
+fPoint droneLocationBuffer;
+
 {
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex
+landingAreaCenterBuffer = landingAreaCenter;
+droneLocationBuffer = droneCenter;
+}
+
+//Add the drone's current location area to the path
+extendedCommand.add_path_x_coordinates(droneLocationBuffer.val[0]);
+extendedCommand.add_path_y_coordinates(droneLocationBuffer.val[1]);
+
+follow_path_command *originalCommandRef = receivedCommand.mutable_follow_path_command_field();
+
+for(int i=0; i<originalCommandRef->path_x_coordinates_size() && i<originalCommandRef->path_y_coordinates_size(); i++)
+{
+extendedCommand.add_path_x_coordinates(originalCommandRef->path_x_coordinates(i));
+extendedCommand.add_path_y_coordinates(originalCommandRef->path_y_coordinates(i));
+}
+
+//Add the landing area to path
+extendedCommand.add_path_x_coordinates(landingAreaCenterBuffer.val[0]);
+extendedCommand.add_path_y_coordinates(landingAreaCenterBuffer.val[1]);
+
+//Add takeoff command
+takeoff_command commandToTakeoff;
+command command0(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command0.MutableExtension(takeoff_command::takeoff_command_field)) = commandToTakeoff;
+
+commandQueue.push(command0);
+
+//Add set altitude command to get the quad to keep a certain distance from the ground
+/*
+set_target_altitude_command altitudeCommand;
+altitudeCommand.set_target_altitude(1500.0); //Altitude in mm
+command command4(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command4.MutableExtension(set_target_altitude_command::set_target_altitude_command_field)) = altitudeCommand;
+commandQueue.push(command4);
+*/
+
+//Add a wait command to give a little time for the drone to get in the air
+/*
+wait_command commandToWait;
+commandToWait.set_wait_duration(1);
+command command3(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command3.MutableExtension(wait_command::wait_command_field)) = commandToWait;
+commandQueue.push(command3);
+*/
+
+//Add extended follow path command
+command command1(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command1.MutableExtension(follow_path_command::follow_path_command_field)) = extendedCommand;
+
+commandQueue.push(command1);
+
+
+//Add land command
+landing_command commandToLand;
+command command2(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command2.MutableExtension(landing_command::landing_command_field)) = commandToLand;
+
+commandQueue.push(command2);
+}
+}
+
+if(receivedCommand.has_emergency_stop_command_field() )
+{ //Add emergency stop command to queue with high priority
+command commandToAdd(commandCounter);
+commandToAdd.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+commandCounter++; //Ensure increasing command numbers
+(*commandToAdd.MutableExtension(emergency_stop_command::emergency_stop_command_field)) = *receivedCommand.mutable_emergency_stop_command_field();
+
+commandQueue.push(commandToAdd);
+}
+
+if(receivedCommand.has_return_to_home() && receivedCommand.return_to_home() == true)
+{
+//Time to go home, so add path to home (HIGH_PRIORITY), a landing command (HIGH_PRIORITY), a command to clear all commands after that (HIGH_PRIORITY)
+follow_path_command returnHomePathCommand; //path command with current drone position -> landing
+fPoint landingAreaCenterBuffer;
+fPoint droneLocationBuffer;
+
+{
+std::lock_guard<std::mutex> lock(arucoDataMutex); //Lock mutex
+landingAreaCenterBuffer = landingAreaCenter;
+droneLocationBuffer = droneCenter;
+}
+
+//Drone position -> landing position
+returnHomePathCommand.add_path_x_coordinates(droneLocationBuffer.val[0]);
+returnHomePathCommand.add_path_y_coordinates(droneLocationBuffer.val[1]);
+
+returnHomePathCommand.add_path_x_coordinates(landingAreaCenterBuffer.val[0]);
+returnHomePathCommand.add_path_y_coordinates(landingAreaCenterBuffer.val[1]);
+
+command command0(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command0.MutableExtension(follow_path_command::follow_path_command_field)) = returnHomePathCommand;
+command0.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+
+commandQueue.push(command0);
+
+//Add land command
+landing_command commandToLand;
+command command1(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command1.MutableExtension(landing_command::landing_command_field)) = commandToLand;
+command1.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+
+commandQueue.push(command1);
+
+//Add clear command queue command
+clear_command_queue_command commandToClearQueue;
+command command2(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command2.MutableExtension(clear_command_queue_command::clear_command_queue_command_field)) = commandToClearQueue;
+command2.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+
+commandQueue.push(command2);
+}
+
+//Process any ros callbacks
 ros::spinOnce();
 }
 }
 
+
+/**
+This point takes a marker and set of camera intrinsics that were used to generate the marker and stores the centerpoint of the marker, as well as its x axis and y axis in the image.
+@param inputMarker: The marker to process to establish position
+@param inputCameraIntrinsics: The intrinsics of the camera used with marker
+@param inputCenterPointBuffer: The variable to store the resulting center point in
+@param inputXAxisBuffer: The variable to store the resulting 2d X axis in
+@param inputYAxisBuffer: The variable to store the resulting 2d Y axis in
+*/
+void soaringPen::getCenterPointAndAxis(aruco::Marker &inputMarker, aruco::CameraParameters &inputCameraIntrinsics, soaringPen::fPoint &inputCenterPointBuffer, soaringPen::fPoint &inputXAxisBuffer, soaringPen::fPoint &inputYAxisBuffer)
+{
+//Mostly adapted from the draw3dAxis function in aruco
+
+float size = inputMarker.ssize * 3;
+cv::Mat objectPoints(4, 3, CV_32FC1);
+objectPoints.at<float>(0, 0) = 0;
+objectPoints.at<float>(0, 1) = 0;
+objectPoints.at<float>(0, 2) = 0;
+objectPoints.at<float>(1, 0) = size;
+objectPoints.at<float>(1, 1) = 0;
+objectPoints.at<float>(1, 2) = 0;
+objectPoints.at<float>(2, 0) = 0;
+objectPoints.at<float>(2, 1) = size;
+objectPoints.at<float>(2, 2) = 0;
+objectPoints.at<float>(3, 0) = 0;
+objectPoints.at<float>(3, 1) = 0;
+objectPoints.at<float>(3, 2) = size;
+
+vector<cv::Point2f> imagePoints;
+cv::projectPoints(objectPoints, inputMarker.Rvec, inputMarker.Tvec, inputCameraIntrinsics.CameraMatrix, inputCameraIntrinsics.Distorsion, imagePoints);
+
+//Set points
+inputCenterPointBuffer.val[0] = (imagePoints[0].x - CAMERA_IMAGE_WIDTH/2.0) / CAMERA_IMAGE_DIAGONAL_SIZE;
+inputCenterPointBuffer.val[1] = (imagePoints[0].y - CAMERA_IMAGE_HEIGHT/2.0) / CAMERA_IMAGE_DIAGONAL_SIZE;
+
+inputXAxisBuffer.val[0] = (imagePoints[1].x - imagePoints[0].x) / CAMERA_IMAGE_DIAGONAL_SIZE;
+inputXAxisBuffer.val[1] = (imagePoints[1].y - imagePoints[0].y) / CAMERA_IMAGE_DIAGONAL_SIZE;
+
+inputYAxisBuffer.val[0] = (imagePoints[2].x - imagePoints[0].x) / CAMERA_IMAGE_DIAGONAL_SIZE;
+inputYAxisBuffer.val[1] = (imagePoints[2].y - - imagePoints[0].y) / CAMERA_IMAGE_DIAGONAL_SIZE;
+}
