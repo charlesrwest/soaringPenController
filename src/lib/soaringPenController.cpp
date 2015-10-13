@@ -52,7 +52,7 @@ emergencyStopTriggered = false;
 maintainAltitude = false;
 maintainQRCodeDefinedPosition = false;
 maintainQRCodeDefinedOrientation = false;
-targetAltitude = 1000.0; //The altitude to maintain in mm
+targetAltitude = 500.0; //The altitude to maintain in mm
 xHeading = 0.0; 
 yHeading = 0.0; 
 currentAngularVelocitySetting = 0.0; //The setting of the current velocity
@@ -620,6 +620,13 @@ return true;
 }
 }
 
+printf("Command queue size: %ld\n", commandQueue.size());
+
+if(commandQueue.size() == 0 && checkIfCurrentCommandIsCompleted())
+{
+currentCommand.commandNumber = -1;
+}
+
 return false;
 }
 
@@ -643,6 +650,7 @@ if(currentCommand.commandNumber == -1 && onTheGroundWithMotorsOff)
 return; //Current command is invalid, but we are on the ground so it is OK
 }
 
+
 if(currentCommand.commandNumber == -1 && !onTheGroundWithMotorsOff)
 {//Flying, but without commands... Land immediately
 printf("Initiating automatic landing due to lack of commands\n");
@@ -653,6 +661,7 @@ commandCounter++;
 (*commandBuffer.MutableExtension(landing_command::landing_command_field)) = landCommand;
 commandQueue.push(commandBuffer);
 }
+
 
 SOM_TRY
 if(adjustBehavior() == false)
@@ -677,6 +686,8 @@ catch(const std::exception &inputException)
 printf("Exception: %s\n", inputException.what());
 }
 
+
+printf("Function completed\n");
 }
 
 
@@ -701,7 +712,9 @@ while(commandQueue.size() > 0)
 {
 commandQueue.pop();
 }
-return checkIfCurrentCommandIsCompleted();
+currentCommand.commandNumber = -1; //Clear command completed
+
+return true;
 }
 
 if(currentCommand.HasExtension(emergency_stop_command::emergency_stop_command_field))
@@ -757,7 +770,7 @@ droneYAxisBuffer = droneYAxis;
 printf("X axis: %lf %lf\nY axis: %lf %lf\n", droneXAxisBuffer.val[0], droneXAxisBuffer.val[1], droneYAxisBuffer.val[0], droneYAxisBuffer.val[1]);
 
 targetOrientationInLocalCoordinates.val[0] = dot(fPoint(1.0, 0.0), droneXAxisBuffer);
-targetOrientationInLocalCoordinates.val[1] = dot(fPoint(0.0, 1.0), droneYAxisBuffer);
+targetOrientationInLocalCoordinates.val[1] = dot(fPoint(1.0, 0.0), droneYAxisBuffer);
 
 //Compute current path location in image coordinates, then convert to local coordinates
 fPoint pathLocation;
@@ -832,8 +845,9 @@ return checkIfCurrentCommandIsCompleted();
 if(currentCommand.HasExtension(landing_command::landing_command_field))
 {
 printf("Landing\n");
-if(landing != true)
+if(state != LANDED && state != LANDING)
 {
+printf("Activating landing sequence!!!!!!!!!!!!!\n");
 SOM_TRY
 activateLandingSequence();
 SOM_CATCH("Error activating landing sequence")
@@ -855,6 +869,16 @@ void soaringPenController::handleLowLevelBehavior()
 {
 printf("I was called\n");
 
+if(state == LANDED && currentCommand.HasExtension(landing_command::landing_command_field))
+{
+onTheGroundWithMotorsOff = true;
+takingOff = false;
+//maintainAltitude = false;
+landing = false;
+}
+
+maintainAltitude = true;
+
 if(controlEngineIsDisabled || onTheGroundWithMotorsOff || emergencyStopTriggered || shutdownControlEngine)
 {
 printf("No control %d %d %d\n", controlEngineIsDisabled,  onTheGroundWithMotorsOff, emergencyStopTriggered);
@@ -864,12 +888,12 @@ return; //Return if we shouldn't be trying to fly
 double zThrottle = 0.0;
 
 
-if(maintainAltitude)
+if(maintainAltitude && (state == FLYING && altitude > 300.0))
 {
 double pTerm = (targetAltitude - fabs(altitude));
-//targetAltitudeITerm = targetAltitudeITerm + pTerm;
+targetAltitudeITerm = targetAltitudeITerm + pTerm;
 
-//zThrottle = pTerm/600.0 + targetAltitudeITerm/100000000.0; //PI control for altitude
+zThrottle = pTerm/600.0 + targetAltitudeITerm/100000000.0; //PI control for altitude
 
 //printf("Altitude values: target: %.1lf Current: %.1lf Diff: %.1lf throt:  %.1lf I:%.1lf\n", targetAltitude, altitude, targetAltitude -altitude, zThrottle, targetAltitudeITerm); 
 }
@@ -877,20 +901,32 @@ double pTerm = (targetAltitude - fabs(altitude));
 //Land if tracking lost
 if(framesSinceDroneDetected > 10)
 {
+printf("DRONE LOST!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 SOM_TRY
-maintainQRCodeDefinedPosition = false;
-activateLandingSequence();
-while(commandQueue.size() > 0)
-{ //Clear command queue
-commandQueue.pop();
-}
+//Add land command
+landing_command commandToLand;
+command command1(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command1.MutableExtension(landing_command::landing_command_field)) = commandToLand;
+command1.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+
+commandQueue.push(command1);
+
+//Add clear command queue command
+clear_command_queue_command commandToClearQueue;
+command command2(commandCounter);
+commandCounter++; //Ensure increasing command numbers
+(*command2.MutableExtension(clear_command_queue_command::clear_command_queue_command_field)) = commandToClearQueue;
+command2.set_priority(HIGH_PRIORITY_COMMAND_CONSTANT);
+
+commandQueue.push(command2);
 SOM_CATCH("Error triggering emergency landing and clearing command queue")
 return;
 }
 
 //Maintain orientation toward desired position
-//double zRotationThrottle = -targetOrientationInLocalCoordinates.val[0];
-double zRotationThrottle = 0;
+double zRotationThrottle = -.5*targetOrientationInLocalCoordinates.val[0];
+//double zRotationThrottle = 0;
 
 
 //printf("Rotation throttle: %lf\n", zRotationThrottle);
@@ -914,13 +950,27 @@ printf("Relative position: %lf, %lf\n", pathTargetPointInLocalRelativeImageCoord
 
 //Lab camera height is 3.048, should be linear increase of parameters with height due to shrinking of pixel distances
 
+
+if((heightOfCameraFromFloor/3.048)*pathTargetPointInLocalRelativeImageCoordinates.mag() < .25)
+{//Near to the target point
 //Positive x is forward
-xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]) -.0006*velocityX; //-.00015*velocityX
+xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]) -.0005*velocityX; //-.00015*velocityX
 printf("X Throttle: %lf\n", xThrottle);
 
 //Positive y is right
-yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]) -.0006*velocityY; //+ .00015*velocityY 
+yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]) -.0005*velocityY; //+ .00015*velocityY 
 printf("Y Throttle: %lf\n", yThrottle);
+}
+else
+{ //Far from target point, so make sure it doesn't start moving too fast
+//Positive x is forward
+xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityX; //-.00015*velocityX
+printf("X Throttle: %lf\n", xThrottle);
+
+//Positive y is right
+yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityY; //+ .00015*velocityY 
+printf("Y Throttle: %lf\n", yThrottle);
+}
 
 }
 
@@ -1048,6 +1098,8 @@ This function repeatedly calls ros::spinOnce until the shouldExitFlag is set (us
 */
 void soaringPenController::initializeAndRunSpinThread()
 {
+printf("YAY!!!!!!!!!!!!!!!!!!\n");
+
 bool messageReceived = false;
 bool messageDeserialized = false;
 while(shouldExitFlag != true)
