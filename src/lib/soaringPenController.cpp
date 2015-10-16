@@ -764,13 +764,13 @@ droneCenterBuffer = droneCenter;
 droneXAxisBuffer = droneXAxis;
 droneYAxisBuffer = droneYAxis;
 }
-//droneXAxisBuffer.normalize(); //Make unit vectors
-//droneYAxisBuffer.normalize();
+droneXAxisBuffer.normalize(); //Make unit vectors
+droneYAxisBuffer.normalize();
 
 printf("X axis: %lf %lf\nY axis: %lf %lf\n", droneXAxisBuffer.val[0], droneXAxisBuffer.val[1], droneYAxisBuffer.val[0], droneYAxisBuffer.val[1]);
 
-targetOrientationInLocalCoordinates.val[0] = dot(fPoint(1.0, 0.0), droneXAxisBuffer);
-targetOrientationInLocalCoordinates.val[1] = dot(fPoint(1.0, 0.0), droneYAxisBuffer);
+targetOrientationInLocalCoordinates.val[0] = dot(fPoint(0.0, 1.0), droneXAxisBuffer);
+targetOrientationInLocalCoordinates.val[1] = dot(fPoint(0.0, 1.0), droneYAxisBuffer);
 
 //Compute current path location in image coordinates, then convert to local coordinates
 fPoint pathLocation;
@@ -888,6 +888,7 @@ return; //Return if we shouldn't be trying to fly
 double zThrottle = 0.0;
 
 
+/*
 if(maintainAltitude && (state == FLYING && altitude > 300.0))
 {
 double pTerm = (targetAltitude - fabs(altitude));
@@ -897,9 +898,10 @@ zThrottle = pTerm/600.0 + targetAltitudeITerm/100000000.0; //PI control for alti
 
 //printf("Altitude values: target: %.1lf Current: %.1lf Diff: %.1lf throt:  %.1lf I:%.1lf\n", targetAltitude, altitude, targetAltitude -altitude, zThrottle, targetAltitudeITerm); 
 }
+*/
 
 //Land if tracking lost
-if(framesSinceDroneDetected > 10)
+if(framesSinceDroneDetected > 15)
 {
 printf("DRONE LOST!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 SOM_TRY
@@ -925,7 +927,7 @@ return;
 }
 
 //Maintain orientation toward desired position
-double zRotationThrottle = -.5*targetOrientationInLocalCoordinates.val[0];
+double zRotationThrottle = -targetOrientationInLocalCoordinates.val[0];
 //double zRotationThrottle = 0;
 
 
@@ -951,29 +953,35 @@ printf("Relative position: %lf, %lf\n", pathTargetPointInLocalRelativeImageCoord
 //Lab camera height is 3.048, should be linear increase of parameters with height due to shrinking of pixel distances
 
 
+/*
 if((heightOfCameraFromFloor/3.048)*pathTargetPointInLocalRelativeImageCoordinates.mag() < .25)
 {//Near to the target point
+*/
 //Positive x is forward
-xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]) -.0005*velocityX; //-.00015*velocityX
+xThrottle = (heightOfCameraFromFloor/3.048)*(1.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]) -.0005*velocityX; //-.00015*velocityX
 printf("X Throttle: %lf\n", xThrottle);
 
 //Positive y is right
-yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]) -.0005*velocityY; //+ .00015*velocityY 
+yThrottle = (heightOfCameraFromFloor/3.048)*(-1.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]) -.0005*velocityY; //+ .00015*velocityY 
 printf("Y Throttle: %lf\n", yThrottle);
+/*
 }
 else
 { //Far from target point, so make sure it doesn't start moving too fast
 //Positive x is forward
-xThrottle = (heightOfCameraFromFloor/3.048)*(3.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityX; //-.00015*velocityX
+xThrottle = (heightOfCameraFromFloor/3.048)*(4.0*pathTargetPointInLocalRelativeImageCoordinates.val[0]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityX; //-.00015*velocityX
 printf("X Throttle: %lf\n", xThrottle);
 
 //Positive y is right
-yThrottle = (heightOfCameraFromFloor/3.048)*(-3.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityY; //+ .00015*velocityY 
+yThrottle = (heightOfCameraFromFloor/3.048)*(-4.0*pathTargetPointInLocalRelativeImageCoordinates.val[1]/(pathTargetPointInLocalRelativeImageCoordinates.mag()*4.0)) -.0008*velocityY; //+ .00015*velocityY 
 printf("Y Throttle: %lf\n", yThrottle);
 }
+*/
 
 }
 
+
+printf("XY throttle: %lf %lf\n", xThrottle, yThrottle);
 
 
 //Tell the drone how it should move TODO: Change back
@@ -1286,5 +1294,5 @@ inputXAxisBuffer.val[0] = (imagePoints[1].x - imagePoints[0].x) / CAMERA_IMAGE_D
 inputXAxisBuffer.val[1] = (imagePoints[1].y - imagePoints[0].y) / CAMERA_IMAGE_DIAGONAL_SIZE;
 
 inputYAxisBuffer.val[0] = (imagePoints[2].x - imagePoints[0].x) / CAMERA_IMAGE_DIAGONAL_SIZE;
-inputYAxisBuffer.val[1] = (imagePoints[2].y - - imagePoints[0].y) / CAMERA_IMAGE_DIAGONAL_SIZE;
+inputYAxisBuffer.val[1] = (imagePoints[2].y - imagePoints[0].y) / CAMERA_IMAGE_DIAGONAL_SIZE;
 }
